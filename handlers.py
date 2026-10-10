@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 import asyncio
-from aiogram import Router, F, types, Bot
+from aiogram import Router, F, Bot
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice
 
 from config import (ADMIN_IDS, CHANNEL, CHANNEL_LINK, CANCEL_MINUTES,
                     REFERRAL_POINT, IBAN, IBAN_NAME, COUNTRIES)
@@ -220,8 +220,8 @@ async def cb_deposit(cb: CallbackQuery):
         "Tum odemeler manuel onaylanir."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Yildiz ile Ode", callback_data="pay_stars", style="success")],
-        [InlineKeyboardButton(text="Geri", callback_data="back_menu", style="primary")],
+        [InlineKeyboardButton(text="Yildiz ile Ode", callback_data="pay_stars")],
+        [InlineKeyboardButton(text="Geri", callback_data="back_menu")],
     ])
     await cb.message.edit_text(txt, reply_markup=kb)
 
@@ -232,7 +232,7 @@ async def cb_pay_stars(cb: CallbackQuery, bot: Bot):
             chat_id=cb.from_user.id, title="Bakiye Yukleme",
             description="10 TL = 10 Yildiz", payload="topup_10",
             provider_token="", currency="XTR",
-            prices=[types.LabeledPrice(label="Bakiye", amount=10)])
+            prices=[LabeledPrice(label="Bakiye", amount=10)])
     except Exception:
         await cb.answer("Yildiz odeme su an kapali.", show_alert=True)
 
@@ -247,6 +247,90 @@ async def cb_profile(cb: CallbackQuery):
         txt += f"{sign}{amt} TL - {desc}\n"
     if not txs: txt += "Henuz islem yok"
     await cb.message.edit_text(txt, reply_markup=main_menu(is_admin(cb.from_user.id)))
+
+@router.callback_query(F.data == "referral")
+async def cb_referral(cb: CallbackQuery, bot: Bot):
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{cb.from_user.id}"
+    u = await db.get_user(cb.from_user.id)
+    await cb.message.edit_text(
+        f"Referans Sistemin\n\n{link}\n\nHer davet = +{REFERRAL_POINT} puan\nMevcut Puanin: {u[4]}",
+        reply_markup=main_menu(is_admin(cb.from_user.id)))
+
+@router.callback_query(F.data == "leaderboard")
+async def cb_lb(cb: CallbackQuery):
+    top = await db.top_referrers(10)
+    txt = "Referans Liderlik Tablosu\n\n"
+    if not top:
+        txt += "Henuz kimse referans toplamamis"
+    else:
+        for i, (uid, name, uname, pts) in enumerate(top, 1):
+            medal = ["1.","2.","3."][i-1] if i <= 3 else f"{i}."
+            txt += f"{medal} {name or uname or uid} - {pts} puan\n"
+    await cb.message.edit_text(txt, reply_markup=main_menu(is_admin(cb.from_user.id)))
+
+@router.callback_query(F.data == "contact_admin")
+async def cb_contact(cb: CallbackQuery, bot: Bot):
+    admin_id = ADMIN_IDS[0]
+    try:
+        chat = await bot.get_chat(admin_id)
+        if chat.username:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Admin ile Konus", url=f"https://t.me/{chat.username}")],
+                [InlineKeyboardButton(text="Geri", callback_data="back_menu")],
+            ])
+            await cb.message.edit_text(f"Admin Iletisim\n\n@{chat.username}", reply_markup=kb)
+        else:
+            await cb.answer(f"Admin: {chat.first_name}\nID: {admin_id}", show_alert=True)
+    except Exception:
+        await cb.answer(f"Admin ID: {admin_id}", show_alert=True)
+
+@router.callback_query(F.data == "help")
+async def cb_help(cb: CallbackQuery):
+    txt = (
+        "Yardim\n\n"
+        "Marketten uygulama sec, ulke sec, satin al.\n"
+        "Admin manuel olarak numara + kodu iletir.\n"
+        "Kod gelirse bakiye kesin cekilir.\n"
+        f"{CANCEL_MINUTES} dk icinde iptal = tam iade.\n"
+        f"Her referans = +{REFERRAL_POINT} puan.\n\n"
+        f"Kanal: {CHANNEL_LINK}"
+    )
+    await cb.message.edit_text(txt, reply_markup=main_menu(is_admin(cb.from_user.id)))
+
+@router.callback_query(F.data == "promo_use")
+async def cb_promo_use(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(Flow.promo_use)
+    await cb.message.edit_text("Promo kodunu yaz:", reply_markup=back_kb())
+
+@router.message(Flow.promo_use)
+async def recv_promo(m: Message, state: FSMContext, bot: Bot):
+    code = m.text.strip().upper()
+    p = await db.get_promo(code)
+    if not p:
+        await m.answer("Gecersiz kod.", reply_markup=main_menu(is_admin(m.from_user.id)))
+        await state.clear(); return
+    pid = p[0]
+    if p[3] >= p[2] or await db.user_used_promo(pid, m.from_user.id):
+        await m.answer("Kod kullanilamaz.", reply_markup=main_menu(is_admin(m.from_user.id)))
+        await state.clear(); return
+    await db.inc_promo_use(pid)
+    await db.add_promo_use(pid, m.from_user.id)
+    await db.update_balance(m.from_user.id, p[5])
+    await db.add_tx(m.from_user.id, p[5], "promo", f"Promo: {code}")
+    await m.answer(f"Promo kullanildi! +{p[5]} TL",
+                   reply_markup=main_menu(is_admin(m.from_user.id)))
+    await state.clear()
+    from scheduler import promo_text
+    p2 = await db.get_promo_by_id(pid)
+    if p2[3] >= p2[2]:
+        try: await bot.delete_message(CHANNEL, p2[6])
+        except: pass
+        await db.deactivate_promo(pid)
+    else:
+        try:
+            await bot.edit_message_text(chat_id=CHANNEL, message_id=p2[6], text=promo_text(p2))
+        except: passnu(is_admin(cb.from_user.id)))
 
 @router.callback_query(F.data == "referral")
 async def cb_referral(cb: CallbackQuery, bot: Bot):
