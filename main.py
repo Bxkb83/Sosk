@@ -25,6 +25,13 @@ from aiogram.types import (
     KeyboardButton,
     User,
 )
+from bot_extensions import (
+    init_feature_schema,
+    get_language,
+    order_rating_keyboard,
+    router as extensions_router,
+    user_is_banned,
+)
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -39,6 +46,7 @@ STAR_TOPUP_TIERS_RAW = os.getenv("STAR_TOPUP_TIERS", "").strip()
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "").strip()
 JOIN_CHANNEL_URL = os.getenv("JOIN_CHANNEL_URL", "").strip()
 LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "").strip()
+PROMO_CHANNEL_ID = os.getenv("PROMO_CHANNEL_ID", "").strip()
 CANCEL_SECONDS = 6 * 60
 DAILY_REWARD_CENTS = 100
 MAX_AMOUNT_CENTS = 100_000_000
@@ -102,12 +110,12 @@ class AdminDeleteServiceFlow(StatesGroup):
     service_id = State()
 
 
-class AdminEnterNumberFlow(StatesGroup):
-    phone = State()
-    code = State()
+class AdminDeliveryFlow(StatesGroup):
+    note = State()
 
 
 def parse_star_topup_tiers(raw=STAR_TOPUP_TIERS_RAW):
+    """Parse administrator-defined "stars:TL" pairs without inventing a rate."""
     tiers = []
     if not raw:
         return tiers
@@ -161,6 +169,14 @@ def parse_money(value):
     if cents > MAX_AMOUNT_CENTS:
         raise ValueError("Tutar izin verilen sinirin uzerinde.")
     return cents
+
+
+try:
+    WELCOME_BONUS_CENTS = parse_money(
+        os.getenv("WELCOME_BONUS_TL", "1").strip()
+    )
+except ValueError as exc:
+    raise RuntimeError("WELCOME_BONUS_TL must be a positive TL amount.") from exc
 
 
 try:
@@ -236,9 +252,30 @@ def join_channel_keyboard():
 
 class JoinChannelMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is not None and not is_admin(user.id):
+            if await user_is_banned(user.id):
+                if isinstance(event, Message):
+                    await event.answer(
+                        "Hesabiniz bot yoneticisi tarafindan kapatildi."
+                    )
+                elif isinstance(event, CallbackQuery):
+                    await event.answer(
+                        "Hesabiniz bot yoneticisi tarafindan kapatildi.",
+                        show_alert=True,
+                    )
+                return None
+            async with db_session() as db:
+                await db.execute(
+                    "UPDATE users SET last_seen_at = ? WHERE user_id = ?",
+                    (timestamp(), user.id),
+                )
+                await db.commit()
+        if user is None or is_admin(user.id):
+            if not FORCE_JOIN_CHANNEL:
+                return await handler(event, data)
         if not FORCE_JOIN_CHANNEL:
             return await handler(event, data)
-        user = getattr(event, "from_user", None)
         if user is None or is_admin(user.id):
             return await handler(event, data)
         if isinstance(event, Message) and event.successful_payment:
@@ -274,8 +311,67 @@ class JoinChannelMiddleware(BaseMiddleware):
         return None
 
 
+class RateLimitMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if (
+            not isinstance(event, Message)
+            or event.from_user is None
+            or is_admin(event.from_user.id)
+            or event.successful_payment
+            or (event.text or "").strip() == "/cancel"
+        ):
+            return await handler(event, data)
+        state = data.get("state")
+        if state is not None:
+            try:
+                if await state.get_state():
+                    return await handler(event, data)
+            except Exception:
+                pass
+        user_id = event.from_user.id
+        current = now_utc()
+        current_text = current.isoformat(timespec="seconds")
+        db = await open_db()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await db.execute(
+                "SELECT last_message_at FROM message_rate_limits WHERE user_id = ?",
+                (user_id,),
+            )
+            row = await cursor.fetchone()
+            if row:
+                previous = datetime.fromisoformat(row["last_message_at"])
+                remaining = 30 - int((current - previous).total_seconds())
+                if remaining > 0:
+                    await db.rollback()
+                    await event.answer(
+                        "Guvenlik siniri: yeni mesaj icin "
+                        + str(remaining)
+                        + " saniye bekleyin."
+                    )
+                    return None
+            await db.execute(
+                """
+                INSERT INTO message_rate_limits (user_id, last_message_at)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    last_message_at = excluded.last_message_at
+                """,
+                (user_id, current_text),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+        return await handler(event, data)
+
+
 router.message.outer_middleware(JoinChannelMiddleware())
 router.callback_query.outer_middleware(JoinChannelMiddleware())
+router.message.outer_middleware(RateLimitMiddleware())
+router.include_router(extensions_router)
 
 
 async def log_event(bot, text):
@@ -325,18 +421,214 @@ async def validate_channels(bot):
             raise RuntimeError(
                 "Bot must be an administrator in LOG_CHANNEL_ID."
             )
+    if PROMO_CHANNEL_ID:
+        try:
+            await bot.get_chat(PROMO_CHANNEL_ID)
+            membership = await bot.get_chat_member(
+                chat_id=PROMO_CHANNEL_ID,
+                user_id=me.id,
+            )
+        except TelegramAPIError as exc:
+            raise RuntimeError(
+                "Bot cannot access PROMO_CHANNEL_ID. Check the channel ID "
+                "and add the bot as an administrator."
+            ) from exc
+        if membership.status not in ("administrator", "creator"):
+            raise RuntimeError(
+                "Bot must be an administrator in PROMO_CHANNEL_ID."
+            )
     logger.info("Telegram bot connected as @%s", me.username or me.id)
 
 
-def main_keyboard(user_id):
+def main_keyboard(user_id, language="tr"):
+    english = language == "en"
     rows = [
         [
-            KeyboardButton(text="Hizmetler", style="primary"),
-            KeyboardButton(text="Bakiye", style="success"),
+            KeyboardButton(text="Services" if english else "Hizmetler", style="primary"),
+            KeyboardButton(text="Balance" if english else "Bakiye", style="success"),
         ],
         [
-            KeyboardButton(text="Siparisler", style="primary"),
-            KeyboardButton(text="Bakiye Yukle", style="success"),
+            KeyboardButton(text="Orders" if english else "Siparisler", style="primary"),
+            KeyboardButton(text="Add balance" if english else "Bakiye Yukle", style="success"),
+        ],
+        [
+            KeyboardButton(text="Promo" if english else "Promosyon", style="success"),
+            KeyboardButton(text="Referrals" if english else "Referans", style="primary"),
+        ],
+        [
+            KeyboardButton(
+                text="Help" if english else "Yardim",
+                style="primary",
+            ),
+        ],
+    ]
+    if is_admin(user_id):
+        rows.append([KeyboardButton(text="Admin Paneli", style="primary")])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def service_keyboard(services):
+    rows = []
+    for service in services:
+        label = clean_text(service["name"], 45)
+        if service["vip_only"]:
+            label = "💎 " + label
+        if (
+            service["sale_percent"]
+            and service["sale_until"]
+            and service["sale_until"] > timestamp()
+        ):
+            label = "🔥 " + label
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data="s:" + str(service["service_id"]),
+                    style="primary",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def service_detail_keyboard(service_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Siparis Olustur",
+                    callback_data="b:" + str(service_id),
+                    style="success",
+                )
+            ]
+        ]
+    )
+
+
+def order_keyboard(order_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Iptal Et ve Iade Al",
+                    callback_data="o:cancel:" + str(order_id),
+                    style="danger",
+                )
+            ]
+        ]
+    )
+
+
+def admin_order_keyboard(order_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Teslimat notu gonder",
+                    callback_data="o:deliver:" + str(order_id),
+                    style="success",
+                ),
+                InlineKeyboardButton(
+                    text="Iptal Et ve Iade",
+                    callback_data="o:refund:" + str(order_id),
+                    style="danger",
+                ),
+            ]
+        ]
+    )
+
+
+def deposit_keyboard(deposit_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Onayla",
+                    callback_data="d:approve:" + str(deposit_id),
+                    style="success",
+                ),
+                InlineKeyboardButton(
+                    text="Reddet",
+                    callback_data="d:reject:" + str(deposit_id),
+                    style="danger",
+                ),
+            ]
+        ]
+    )
+
+
+async def open_db():
+    db = await aiosqlite.connect(DB_PATH, timeout=10)
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA foreign_keys = ON")
+    await db.execute("PRAGMA busy_timeout = 10000")
+    return db
+
+
+@asynccontextmanager
+async def db_session():
+    db = await open_db()
+    try:
+        yield db
+    finally:
+        await db.close()
+
+
+async def ensure_db_column(db, table, column, declaration):
+    cursor = await db.execute(f"PRAGMA table_info({table})")
+    columns = {row["name"] for row in await cursor.fetchall()}
+    if column not in columns:
+        await db.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+        )
+
+
+async def init_db():
+    if DB_PATH != ":memory:":
+        os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    async with db_session() as db:
+        await db.execute("PRAGMA journal_mode = WAL")
+        await db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT NOT NULL,
+                balance_cents INTEGER NOT NULL DEFAULT 0,
+                last_daily_at TEXT,
+                last_seen_at TEXT,
+                is_banned INTEGER NOT NULL DEFAULT 0,
+                vip_until TEXT,
+                language TEXT NOT NULL DEFAULT 'tr',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS services (
+                service_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                price_cents INTEGER NOT NULL CHECK(price_cents > 0),
+                active INTEGER NOT NULL DEFAULT 1,
+                vip_only INTEGER NOT NULL DEFAULT 0,
+                sale_percent INTEGER NOT NULL DEFAULT 0,
+                sale_until TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(user_id),
+                service_id INTEGER NOT NULL REFERENCES services(service_id),
+                service_name TEXT NOT NULL,
+                amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
+                base_price_cents INTEGER NOT NULL DEFAULT 0,
+                discount_percent INTEGER NOT NULL DEFAULT 0,
+                discount_label TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+           s"),
         ],
         [
             KeyboardButton(text="Promosyon", style="success"),
