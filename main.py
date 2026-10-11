@@ -24,12 +24,12 @@ from aiogram.types import (
 )
 
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("8296234950:AAF0zJu5WgUzMrct9dxdjuL0bzH4lFel814", "").strip()
 DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 PAYMENT_INSTRUCTIONS = os.getenv("PAYMENT_INSTRUCTIONS", "").strip()
-FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "").strip()
-JOIN_CHANNEL_URL = os.getenv("JOIN_CHANNEL_URL", "").strip()
-LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "").strip()
+FORCE_JOIN_CHANNEL = os.getenv("@MythAX", "").strip()
+JOIN_CHANNEL_URL = os.getenv("https://t.me/MythAX", "").strip()
+LOG_CHANNEL_ID = os.getenv("-1004341741074", "").strip()
 CANCEL_SECONDS = 6 * 60
 DAILY_REWARD_CENTS = 100
 MAX_AMOUNT_CENTS = 100_000_000
