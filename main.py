@@ -916,9 +916,12 @@ async def resolve_user_id(identifier):
     if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
         return None
     async with db_session() as db:
-        cursor = await db.execute(
-            """
-            SELEC"),
+async with db_session() as db:
+    cursor = await db.execute(
+        "SELECT * FROM orders WHERE order_id = ?",
+        (order_id,),
+    )
+    order = await cursor.fetchone()
         ],
         [
             KeyboardButton(text="Promosyon", style="success"),
