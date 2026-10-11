@@ -23,7 +23,6 @@ from aiogram.types import (
     PreCheckoutQuery,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    User,
 )
 
 
@@ -403,8 +402,29 @@ def admin_order_keyboard(order_id):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Numara ve Kod Gir",
+                    text="Numara Gir",
                     callback_data="n:" + str(order_id),
+                    style="success",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Iptal Et ve Iade",
+                    callback_data="o:refund:" + str(order_id),
+                    style="danger",
+                ),
+            ],
+        ]
+    )
+
+
+def admin_enter_code_keyboard(order_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Kod Gir",
+                    callback_data="c:" + str(order_id),
                     style="success",
                 )
             ],
@@ -1080,8 +1100,9 @@ def admin_help_text():
             "/deposits",
             "/stats",
             "",
-            "Siparis geldiginde 'Numara ve Kod Gir' butonuna basarak",
-            "telefon numarasi ve SMS kodunu manuel girin.",
+            "Siparis geldiginde once 'Numara Gir' butonuna basip",
+            "telefon numarasini girin. Numara kullaniciya iletildikten",
+            "sonra 'Kod Gir' butonuna basarak SMS kodunu girin.",
         ]
     )
 
@@ -1156,10 +1177,12 @@ SPINNER_POSITIONS = [
 ]
 
 ACTIVE_ANIMATIONS = {}
+ORDER_MESSAGES = {}
+ORDER_PHONE_CACHE = {}
 BULLET = "\u2022"
 
 
-def make_frame(step, center="-----"):
+def render_frame(step, center_text):
     missing = SPINNER_POSITIONS[step % 16]
     lines = []
     for r in range(5):
@@ -1174,9 +1197,21 @@ def make_frame(step, center="-----"):
             else:
                 row_chars.append(" ")
         lines.append(" ".join(row_chars))
-    lines[2] = "  " + center
+    lines[2] = "  " + center_text
     body = "\n".join(lines)
     return "<pre>" + body + "</pre>"
+
+
+def make_frame(step):
+    return render_frame(step, "-----")
+
+
+def make_number_frame(phone):
+    return render_frame(0, "##" + phone + "##")
+
+
+def make_code_frame(code):
+    return render_frame(0, "##" + code + "##")
 
 
 def stop_animation(order_id):
@@ -1214,8 +1249,8 @@ async def start_handler(message: Message):
     text = "\n".join(
         [
             "Merhaba. Bu bot hizmet siparislerini yonetir.",
-            "Siparis verdikten sonra yonetici telefon numarasi",
-            "ve kodu manuel olarak size iletecektir.",
+            "Siparis verdikten sonra yonetici once telefon numaranizi",
+            "sonra SMS kodunu manuel olarak size iletecektir.",
             "Asagidaki menuden devam edin.",
         ]
     )
@@ -1268,9 +1303,9 @@ async def help_handler(message: Message):
         "/referral - Referans linki ve davet sayisi",
         "/stars - Stars ile bakiye yukle",
         "",
-        "Siparis verdikten sonra yonetici telefon numarasini",
-        "ve kodu manuel olarak size iletir. 6 dakika icinde",
-        "iptal ederseniz tam iade alirsiniz.",
+        "Siparis verdikten sonra yonetici once telefon numaranizi",
+        "sonra SMS kodunu size manuel olarak iletir. 6 dakika",
+        "icinde iptal ederseniz tam iade alirsiniz.",
     ]
     await message.answer("\n".join(lines))
 
@@ -1535,7 +1570,7 @@ async def buy_service_handler(callback: CallbackQuery):
             "Rezerve edilen tutar: "
             + format_money(order["amount_cents"]),
             "Iptal suresi: 6 dakika.",
-            "Yonetici numara ve kodu manuel gonderecek.",
+            "Yonetici once numara sonra kodu manuel gonderecek.",
         ]
     )
     if callback.message:
@@ -1551,7 +1586,8 @@ async def buy_service_handler(callback: CallbackQuery):
             initial_frame,
             parse_mode="HTML",
         )
-        ACTIVE_ANIMATIONS[order_id] = (
+        ACTIVE_ANIMATIONS[order_id] = True
+        ORDER_MESSAGES[order_id] = (
             callback.from_user.id,
             anim_msg.message_id,
         )
@@ -1572,7 +1608,7 @@ async def buy_service_handler(callback: CallbackQuery):
             "Kullanici: " + str(callback.from_user.id),
             "Hizmet: " + clean_text(order["service_name"], 80),
             "Tutar: " + format_money(order["amount_cents"]),
-            "Numara ve kod girmek icin butona basin.",
+            "Once 'Numara Gir' butonuna basin.",
         ]
     )
     await notify_admins(
@@ -1625,12 +1661,13 @@ async def enter_number_handler(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer(
             "Siparis #" + str(order_id) + "\n\n"
             "Telefon numarasini yazin (ornek: +905551234567). "
-            "Iptal icin /cancel yazin."
+            "Numara kullaniciya iletilecek, sonra 'Kod Gir' "
+            "butonuna basacaksiniz. Iptal icin /cancel yazin."
         )
 
 
 @router.message(AdminEnterNumberFlow.phone)
-async def enter_phone_handler(message: Message, state: FSMContext):
+async def receive_phone_handler(message: Message, state: FSMContext):
     if message.from_user is None or not is_admin(message.from_user.id):
         await state.clear()
         return
@@ -1638,25 +1675,8 @@ async def enter_phone_handler(message: Message, state: FSMContext):
     if len(phone) < 5:
         await message.answer("Gecerli bir telefon numarasi yazin.")
         return
-    await state.update_data(phone=phone)
-    await state.set_state(AdminEnterNumberFlow.code)
-    await message.answer(
-        "SMS kodunu yazin (ornek: 123456). Iptal icin /cancel yazin."
-    )
-
-
-@router.message(AdminEnterNumberFlow.code)
-async def enter_code_handler(message: Message, state: FSMContext):
-    if message.from_user is None or not is_admin(message.from_user.id):
-        await state.clear()
-        return
-    code = clean_text(message.text or "", 16)
-    if len(code) < 3:
-        await message.answer("Gecerli bir kod yazin.")
-        return
     data = await state.get_data()
     order_id = int(data.get("order_id", 0))
-    phone = data.get("phone", "")
     await state.clear()
     if order_id <= 0:
         await message.answer("Siparis bulunamadi.")
@@ -1673,20 +1693,113 @@ async def enter_code_handler(message: Message, state: FSMContext):
         return
 
     user_id = int(order["user_id"])
+    ORDER_PHONE_CACHE[order_id] = phone
 
-    anim = ACTIVE_ANIMATIONS.pop(order_id, None)
-    if anim:
-        chat_id, msg_id = anim
+    stop_animation(order_id)
+
+    ref = ORDER_MESSAGES.get(order_id)
+    if ref:
+        chat_id, msg_id = ref
         try:
             await message.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=msg_id,
-                text=(
-                    "Siparis #" + str(order_id) + "\n\n"
-                    "Telefon: " + phone + "\n"
-                    "Kod: " + code + "\n\n"
-                    "Bakiye kesin cekildi. Iade yok."
-                ),
+                text=make_number_frame(phone),
+                parse_mode="HTML",
+            )
+        except TelegramAPIError:
+            pass
+
+    await notify_user(
+        message.bot,
+        user_id,
+        "Siparis #" + str(order_id) + " - Numaraniz:\n"
+        "##" + phone + "##\n\n"
+        "SMS kodu geldiginde size iletilecektir.",
+    )
+
+    await message.answer(
+        "Numara kullaniciya iletildi:\n"
+        "##" + phone + "##\n\n"
+        "SMS kodu geldiginde 'Kod Gir' butonuna basin.",
+        reply_markup=admin_enter_code_keyboard(order_id),
+    )
+
+
+@router.callback_query(F.data.startswith("c:"))
+async def enter_code_start_handler(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user is None:
+        await callback.answer()
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Yetkiniz yok.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 2:
+        await callback.answer("Gecersiz islem.", show_alert=True)
+        return
+    try:
+        order_id = int(parts[1])
+    except ValueError:
+        await callback.answer("Siparis bulunamadi.", show_alert=True)
+        return
+    async with db_session() as db:
+        cursor = await db.execute(
+            "SELECT order_id, status FROM orders WHERE order_id = ?",
+            (order_id,),
+        )
+        order = await cursor.fetchone()
+    if order is None or order["status"] != "pending":
+        await callback.answer("Siparis artik beklemiyor.", show_alert=True)
+        return
+    await state.set_state(AdminEnterNumberFlow.code)
+    await state.update_data(order_id=order_id)
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "Siparis #" + str(order_id) + "\n\n"
+            "SMS kodunu yazin (ornek: 123456). Iptal icin /cancel yazin."
+        )
+
+
+@router.message(AdminEnterNumberFlow.code)
+async def receive_code_handler(message: Message, state: FSMContext):
+    if message.from_user is None or not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    code = clean_text(message.text or "", 16)
+    if len(code) < 3:
+        await message.answer("Gecerli bir kod yazin.")
+        return
+    data = await state.get_data()
+    order_id = int(data.get("order_id", 0))
+    await state.clear()
+    if order_id <= 0:
+        await message.answer("Siparis bulunamadi.")
+        return
+
+    async with db_session() as db:
+        cursor = await db.execute(
+            "SELECT * FROM orders WHERE order_id = ?",
+            (order_id,),
+        )
+        order = await cursor.fetchone()
+    if order is None or order["status"] != "pending":
+        await message.answer("Siparis artik beklemiyor.")
+        return
+
+    user_id = int(order["user_id"])
+    phone = ORDER_PHONE_CACHE.pop(order_id, "")
+
+    ref = ORDER_MESSAGES.pop(order_id, None)
+    if ref:
+        chat_id, msg_id = ref
+        try:
+            await message.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=make_code_frame(code),
+                parse_mode="HTML",
             )
         except TelegramAPIError:
             pass
@@ -1700,12 +1813,13 @@ async def enter_code_handler(message: Message, state: FSMContext):
         message.bot,
         user_id,
         "Siparis #" + str(order_id) + " tamamlandi.\n"
-        "Telefon: " + phone + "\n"
-        "Kod: " + code,
+        "Numara: ##" + phone + "##\n"
+        "Kod: ##" + code + "##",
     )
     await message.answer(
-        "Siparis #" + str(order_id) + " tamamlandi. "
-        "Kullaniciya iletildi."
+        "Siparis #" + str(order_id) + " tamamlandi.\n"
+        "Numara: " + phone + "\n"
+        "Kod: " + code,
     )
     await log_event(
         message.bot,
@@ -1739,6 +1853,8 @@ async def order_action_handler(callback: CallbackQuery):
             refund_result, order = await refund_order(order_id)
             if refund_result == "refunded" and order:
                 stop_animation(order_id)
+                ORDER_MESSAGES.pop(order_id, None)
+                ORDER_PHONE_CACHE.pop(order_id, None)
                 await notify_user(
                     callback.bot,
                     order["user_id"],
@@ -1756,6 +1872,8 @@ async def order_action_handler(callback: CallbackQuery):
             await callback.answer("Siparis artik beklemiyor.", True)
             return
         stop_animation(order_id)
+        ORDER_MESSAGES.pop(order_id, None)
+        ORDER_PHONE_CACHE.pop(order_id, None)
         await callback.answer("Tutar iade edildi.")
         if callback.message:
             await callback.message.answer(
@@ -1780,6 +1898,8 @@ async def order_action_handler(callback: CallbackQuery):
             await callback.answer("Siparis artik beklemiyor.", True)
             return
         stop_animation(order_id)
+        ORDER_MESSAGES.pop(order_id, None)
+        ORDER_PHONE_CACHE.pop(order_id, None)
         await notify_user(
             callback.bot,
             order["user_id"],
@@ -1801,6 +1921,8 @@ async def order_action_handler(callback: CallbackQuery):
             return
         if result == "expired":
             stop_animation(order_id)
+            ORDER_MESSAGES.pop(order_id, None)
+            ORDER_PHONE_CACHE.pop(order_id, None)
             await notify_user(
                 callback.bot,
                 order["user_id"],
@@ -1812,6 +1934,8 @@ async def order_action_handler(callback: CallbackQuery):
             await callback.answer("Siparis tamamlanamadi.", True)
             return
         stop_animation(order_id)
+        ORDER_MESSAGES.pop(order_id, None)
+        ORDER_PHONE_CACHE.pop(order_id, None)
         await notify_user(
             callback.bot,
             order["user_id"],
