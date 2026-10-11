@@ -25,13 +25,6 @@ from aiogram.types import (
     KeyboardButton,
     User,
 )
-from bot_extensions import (
-    init_feature_schema,
-    get_language,
-    order_rating_keyboard,
-    router as extensions_router,
-    user_is_banned,
-)
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -46,7 +39,6 @@ STAR_TOPUP_TIERS_RAW = os.getenv("STAR_TOPUP_TIERS", "").strip()
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "").strip()
 JOIN_CHANNEL_URL = os.getenv("JOIN_CHANNEL_URL", "").strip()
 LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "").strip()
-PROMO_CHANNEL_ID = os.getenv("PROMO_CHANNEL_ID", "").strip()
 CANCEL_SECONDS = 6 * 60
 DAILY_REWARD_CENTS = 100
 MAX_AMOUNT_CENTS = 100_000_000
@@ -110,12 +102,12 @@ class AdminDeleteServiceFlow(StatesGroup):
     service_id = State()
 
 
-class AdminDeliveryFlow(StatesGroup):
-    note = State()
+class AdminEnterNumberFlow(StatesGroup):
+    phone = State()
+    code = State()
 
 
 def parse_star_topup_tiers(raw=STAR_TOPUP_TIERS_RAW):
-    """Parse administrator-defined "stars:TL" pairs without inventing a rate."""
     tiers = []
     if not raw:
         return tiers
@@ -169,14 +161,6 @@ def parse_money(value):
     if cents > MAX_AMOUNT_CENTS:
         raise ValueError("Tutar izin verilen sinirin uzerinde.")
     return cents
-
-
-try:
-    WELCOME_BONUS_CENTS = parse_money(
-        os.getenv("WELCOME_BONUS_TL", "1").strip()
-    )
-except ValueError as exc:
-    raise RuntimeError("WELCOME_BONUS_TL must be a positive TL amount.") from exc
 
 
 try:
@@ -252,30 +236,9 @@ def join_channel_keyboard():
 
 class JoinChannelMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        user = getattr(event, "from_user", None)
-        if user is not None and not is_admin(user.id):
-            if await user_is_banned(user.id):
-                if isinstance(event, Message):
-                    await event.answer(
-                        "Hesabiniz bot yoneticisi tarafindan kapatildi."
-                    )
-                elif isinstance(event, CallbackQuery):
-                    await event.answer(
-                        "Hesabiniz bot yoneticisi tarafindan kapatildi.",
-                        show_alert=True,
-                    )
-                return None
-            async with db_session() as db:
-                await db.execute(
-                    "UPDATE users SET last_seen_at = ? WHERE user_id = ?",
-                    (timestamp(), user.id),
-                )
-                await db.commit()
-        if user is None or is_admin(user.id):
-            if not FORCE_JOIN_CHANNEL:
-                return await handler(event, data)
         if not FORCE_JOIN_CHANNEL:
             return await handler(event, data)
+        user = getattr(event, "from_user", None)
         if user is None or is_admin(user.id):
             return await handler(event, data)
         if isinstance(event, Message) and event.successful_payment:
@@ -311,30 +274,359 @@ class JoinChannelMiddleware(BaseMiddleware):
         return None
 
 
-class RateLimitMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        if (
-            not isinstance(event, Message)
-            or event.from_user is None
-            or is_admin(event.from_user.id)
-            or event.successful_payment
-            or (event.text or "").strip() == "/cancel"
-        ):
-            return await handler(event, data)
-        state = data.get("state")
-        if state is not None:
-            try:
-                if await state.get_state():
-                    return await handler(event, data)
-            except Exception:
-                pass
-        user_id = event.from_user.id
-        current = now_utc()
-        current_text = current.isoformat(timespec="seconds")
-        db = await open_db()
-        await db.execute("BEGIN IMMEDIATE")
+router.message.outer_middleware(JoinChannelMiddleware())
+router.callback_query.outer_middleware(JoinChannelMiddleware())
+
+
+async def log_event(bot, text):
+    if not LOG_CHANNEL_ID:
+        return
+    try:
+        await bot.send_message(LOG_CHANNEL_ID, "Bot kaydi:\n" + text)
+    except TelegramAPIError:
+        logger.exception("Could not write to the configured log channel")
+
+
+async def validate_channels(bot):
+    me = await bot.get_me()
+    if FORCE_JOIN_CHANNEL:
+        if not channel_join_url():
+            raise RuntimeError(
+                "A private FORCE_JOIN_CHANNEL needs JOIN_CHANNEL_URL."
+            )
         try:
+            membership = await bot.get_chat_member(
+                chat_id=FORCE_JOIN_CHANNEL,
+                user_id=me.id,
+            )
+        except TelegramAPIError as exc:
+            raise RuntimeError(
+                "Bot cannot access FORCE_JOIN_CHANNEL. Add it to the "
+                "channel as an administrator and check the channel ID."
+            ) from exc
+        if membership.status not in ("administrator", "creator"):
+            raise RuntimeError(
+                "Bot must be an administrator in FORCE_JOIN_CHANNEL "
+                "to verify member status."
+            )
+    if LOG_CHANNEL_ID:
+        try:
+            await bot.get_chat(LOG_CHANNEL_ID)
+            membership = await bot.get_chat_member(
+                chat_id=LOG_CHANNEL_ID,
+                user_id=me.id,
+            )
+        except TelegramAPIError as exc:
+            raise RuntimeError(
+                "Bot cannot access LOG_CHANNEL_ID. Check the channel ID "
+                "and add the bot as an administrator."
+            ) from exc
+        if membership.status not in ("administrator", "creator"):
+            raise RuntimeError(
+                "Bot must be an administrator in LOG_CHANNEL_ID."
+            )
+    logger.info("Telegram bot connected as @%s", me.username or me.id)
+
+
+def main_keyboard(user_id):
+    rows = [
+        [
+            KeyboardButton(text="Hizmetler", style="primary"),
+            KeyboardButton(text="Bakiye", style="success"),
+        ],
+        [
+            KeyboardButton(text="Siparisler", style="primary"),
+            KeyboardButton(text="Bakiye Yukle", style="success"),
+        ],
+        [
+            KeyboardButton(text="Promosyon", style="success"),
+            KeyboardButton(text="Referans", style="primary"),
+        ],
+        [
+            KeyboardButton(text="Yardim"),
+        ],
+    ]
+    if is_admin(user_id):
+        rows.append([KeyboardButton(text="Admin Paneli", style="primary")])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def service_keyboard(services):
+    rows = []
+    for service in services:
+        label = clean_text(service["name"], 45)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data="s:" + str(service["service_id"]),
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def service_detail_keyboard(service_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Siparis Olustur",
+                    callback_data="b:" + str(service_id),
+                    style="success",
+                )
+            ]
+        ]
+    )
+
+
+def order_keyboard(order_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Iptal Et ve Iade Al",
+                    callback_data="o:cancel:" + str(order_id),
+                    style="danger",
+                )
+            ]
+        ]
+    )
+
+
+def admin_order_keyboard(order_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Numara ve Kod Gir",
+                    callback_data="n:" + str(order_id),
+                    style="success",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Iptal Et ve Iade",
+                    callback_data="o:refund:" + str(order_id),
+                    style="danger",
+                ),
+            ],
+        ]
+    )
+
+
+def deposit_keyboard(deposit_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Onayla",
+                    callback_data="d:approve:" + str(deposit_id),
+                    style="success",
+                ),
+                InlineKeyboardButton(
+                    text="Reddet",
+                    callback_data="d:reject:" + str(deposit_id),
+                    style="danger",
+                ),
+            ]
+        ]
+    )
+
+
+async def open_db():
+    db = await aiosqlite.connect(DB_PATH, timeout=10)
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA foreign_keys = ON")
+    await db.execute("PRAGMA busy_timeout = 10000")
+    return db
+
+
+@asynccontextmanager
+async def db_session():
+    db = await open_db()
+    try:
+        yield db
+    finally:
+        await db.close()
+
+
+async def init_db():
+    if DB_PATH != ":memory:":
+        os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    async with db_session() as db:
+        await db.execute("PRAGMA journal_mode = WAL")
+        await db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT NOT NULL,
+                balance_cents INTEGER NOT NULL DEFAULT 0,
+                last_daily_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS services (
+                service_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                price_cents INTEGER NOT NULL CHECK(price_cents > 0),
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(user_id),
+                service_id INTEGER NOT NULL REFERENCES services(service_id),
+                service_name TEXT NOT NULL,
+                amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS transactions (
+                transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(user_id),
+                amount_cents INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                note TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS deposit_requests (
+                deposit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(user_id),
+                amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
+                reference TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS promos (
+                promo_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE,
+                bonus_cents INTEGER NOT NULL CHECK(bonus_cents > 0),
+                max_uses INTEGER NOT NULL CHECK(max_uses > 0),
+                current_uses INTEGER NOT NULL DEFAULT 0,
+                expires_at TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS promo_uses (
+                promo_id INTEGER NOT NULL REFERENCES promos(promo_id),
+                user_id INTEGER NOT NULL REFERENCES users(user_id),
+                used_at TEXT NOT NULL,
+                PRIMARY KEY(promo_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS referrals (
+                referral_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER NOT NULL REFERENCES users(user_id),
+                referred_user_id INTEGER NOT NULL UNIQUE REFERENCES users(user_id),
+                reward_cents INTEGER NOT NULL DEFAULT 0,
+                rewarded_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS star_payment_intents (
+                payload TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(user_id),
+                stars_amount INTEGER NOT NULL CHECK(stars_amount > 0),
+                credit_cents INTEGER NOT NULL CHECK(credit_cents > 0),
+                status TEXT NOT NULL DEFAULT 'pending',
+                telegram_charge_id TEXT UNIQUE,
+                created_at TEXT NOT NULL,
+                paid_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_orders_status_expiry
+                ON orders(status, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_orders_user
+                ON orders(user_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_transactions_user
+                ON transactions(user_id, transaction_id);
+            CREATE INDEX IF NOT EXISTS idx_deposits_status
+                ON deposit_requests(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_referrals_referrer
+                ON referrals(referrer_id, created_at);
+            """
+        )
+        await db.commit()
+
+
+async def ensure_user(user, referrer_id=None):
+    async with db_session() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            "SELECT 1 FROM users WHERE user_id = ?",
+            (user.id,),
+        )
+        is_new = await cursor.fetchone() is None
+        await db.execute(
+            """
+            INSERT INTO users (
+                user_id, username, first_name, created_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name
+            """,
+            (
+                user.id,
+                clean_text(user.username or "", 64),
+                clean_text(user.first_name or "User", 100),
+                timestamp(),
+            ),
+        )
+        if (
+            is_new
+            and isinstance(referrer_id, int)
+            and referrer_id > 0
+            and referrer_id != user.id
+        ):
             cursor = await db.execute(
+                "SELECT 1 FROM users WHERE user_id = ?",
+                (referrer_id,),
+            )
+            if await cursor.fetchone():
+                await db.execute(
+                    """
+                    INSERT OR IGNORE INTO referrals (
+                        referrer_id, referred_user_id, reward_cents,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        referrer_id,
+                        user.id,
+                        REFERRAL_BONUS_CENTS,
+                        timestamp(),
+                    ),
+                )
+        await db.commit()
+
+
+async def resolve_user_id(identifier):
+    value = str(identifier or "").strip()
+    if value.isdigit() and int(value) > 0:
+        user_id = int(value)
+        async with db_session() as db:
+            cursor = await db.execute(
+                "SELECT user_id FROM users WHERE user_id = ?",
+                (user_id,),
+            )
+            row = await cursor.fetchone()
+        return int(row["user_id"]) if row else None
+
+    username = value[1:] if value.startswith("@") else value
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        return None
+    async with db_session() as db:
+        cursor = await db.execute(
+            """
+            SELECor = await db.execute(
                 "SELECT last_message_at FROM message_rate_limits WHERE user_id = ?",
                 (user_id,),
             )
