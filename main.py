@@ -188,7 +188,7 @@ def parse_star_topup_tiers(raw=STAR_TOPUP_TIERS_RAW):
         pair = item.strip().split(":", 1)
         if len(pair) != 2 or not pair[0].strip().isdigit():
             raise ValueError(
-                "STAR_TOPUP_TIERS must use stars:TL pairs, e.g. 100:50,250:125."
+                "STAR_TOPUP_TIERS must use stars:TL pairs."
             )
         stars = int(pair[0].strip())
         if stars < 1 or stars > 100_000:
@@ -321,8 +321,7 @@ class JoinChannelMiddleware(BaseMiddleware):
             if await user_is_banned(user.id):
                 if isinstance(event, Message):
                     await event.answer(
-                        "🚫 Bu hesap botu kullanamıyor. "
-                        "Bir hata olduğunu düşünüyorsan yöneticiyle iletişime geç."
+                        "🚫 Bu hesap botu kullanamıyor."
                     )
                 elif isinstance(event, CallbackQuery):
                     await event.answer(
@@ -360,8 +359,7 @@ class JoinChannelMiddleware(BaseMiddleware):
         if joined is None:
             text = (
                 "⚠️ Kanal üyeliğini şu anda kontrol edemiyorum.\n"
-                "Biraz sonra tekrar dene. Sorun sürerse bot yöneticisi "
-                "kanal ayarlarını kontrol etsin."
+                "Biraz sonra tekrar dene."
             )
             keyboard = None
         else:
@@ -370,8 +368,7 @@ class JoinChannelMiddleware(BaseMiddleware):
                 "Botu kullanmadan önce duyuru kanalımıza katılman gerekiyor:\n"
                 "1️⃣ “Kanala katıl” butonuna dokun.\n"
                 "2️⃣ Kanalı takip ettikten sonra “Katıldım, kontrol et” "
-                "butonuna bas.\n\n"
-                "✅ Kontrol başarılı olunca ana menü açılacak."
+                "butonuna bas."
             )
             keyboard = join_channel_keyboard()
 
@@ -472,13 +469,11 @@ async def validate_channels(bot):
             )
         except TelegramAPIError as exc:
             raise RuntimeError(
-                "Bot cannot access FORCE_JOIN_CHANNEL. Add it to the "
-                "channel as an administrator and check the channel ID."
+                "Bot cannot access FORCE_JOIN_CHANNEL."
             ) from exc
         if membership.status not in ("administrator", "creator"):
             raise RuntimeError(
-                "Bot must be an administrator in FORCE_JOIN_CHANNEL "
-                "to verify member status."
+                "Bot must be an administrator in FORCE_JOIN_CHANNEL."
             )
     if LOG_CHANNEL_ID:
         try:
@@ -489,8 +484,7 @@ async def validate_channels(bot):
             )
         except TelegramAPIError as exc:
             raise RuntimeError(
-                "Bot cannot access LOG_CHANNEL_ID. Check the channel ID "
-                "and add the bot as an administrator."
+                "Bot cannot access LOG_CHANNEL_ID."
             ) from exc
         if membership.status not in ("administrator", "creator"):
             raise RuntimeError(
@@ -505,8 +499,7 @@ async def validate_channels(bot):
             )
         except TelegramAPIError as exc:
             raise RuntimeError(
-                "Bot cannot access PROMO_CHANNEL_ID. Check the channel ID "
-                "and add the bot as an administrator."
+                "Bot cannot access PROMO_CHANNEL_ID."
             ) from exc
         if membership.status not in ("administrator", "creator"):
             raise RuntimeError(
@@ -659,29 +652,27 @@ async def welcome_screen_text(user_id, first_name, language):
         vip_active = False
     name = clean_text(first_name or "", 60) or "Arkadaşım"
     if language == "en":
-        vip_status = f"Active until {vip_until}" if vip_active else "Not active"
+        vip_status = "Active until " + str(vip_until) if vip_active else "Not active"
         return "\n".join(
             [
-                f"✨ Welcome, {name}!",
-                f"💰 Your balance: {format_money(balance)}",
-                f"💎 VIP: {vip_status}",
+                "✨ Welcome, " + name + "!",
+                "💰 Your balance: " + format_money(balance),
+                "💎 VIP: " + vip_status,
                 "",
-                "🛍️ Browse the general service catalog below.",
-                "📱 After ordering, the admin will send your phone number",
-                "then the SMS code manually.",
+                "⚡ Orders are delivered automatically.",
+                "💎 VIP members get priority and 20% discount.",
                 "👇 Choose an option:",
             ]
         )
-    vip_status = f"{vip_until} tarihine kadar aktif" if vip_active else "Aktif değil"
+    vip_status = vip_until + " tarihine kadar aktif" if vip_active else "Aktif değil"
     return "\n".join(
         [
-            f"✨ Hoş geldin, {name}!",
-            f"💰 Bakiyeniz: {format_money(balance)}",
-            f"💎 VIP: {vip_status}",
+            "✨ Hoş geldin, " + name + "!",
+            "💰 Bakiyeniz: " + format_money(balance),
+            "💎 VIP: " + vip_status,
             "",
-            "🛍️ Aşağıdan hizmet kataloğuna göz at.",
-            "📱 Sipariş verdikten sonra yönetici önce telefon numaranı",
-            "sonra SMS kodunu manuel olarak iletecek.",
+            "⚡ Siparişler otomatik teslim edilir.",
+            "💎 VIP üyeler önceliklidir ve %20 indirim alır.",
             "👇 Bir seçenek belirle:",
         ]
     )
@@ -1069,7 +1060,7 @@ async def show_services(message):
     )
 
 
-async def create_order(user_id, service_id):
+async def create_order(user_id, service_id, vip_discount=False):
     db = await open_db()
     await db.execute("BEGIN IMMEDIATE")
     try:
@@ -1086,6 +1077,8 @@ async def create_order(user_id, service_id):
             await db.rollback()
             return "missing", None
         amount = int(service["price_cents"])
+        if vip_discount:
+            amount = int(amount * 80 // 100)
         cursor = await db.execute(
             """
             UPDATE users
@@ -1589,9 +1582,9 @@ async def help_handler(message: Message):
         "/referral - Referans linki ve davet sayisi",
         "/stars - Stars ile bakiye yukle",
         "",
-        "Siparis verdikten sonra yonetici once telefon numaranizi",
-        "sonra SMS kodunu size manuel olarak iletir. 6 dakika",
-        "icinde iptal ederseniz tam iade alirsiniz.",
+        "Siparis verdikten sonra otomatik teslim edilir.",
+        "6 dakika icinde iptal ederseniz tam iade alirsiniz.",
+        "VIP uyeler %20 indirim ve oncelik kazanir.",
     ]
     await message.answer("\n".join(lines))
 
@@ -1795,17 +1788,29 @@ async def service_detail_handler(callback: CallbackQuery):
             (service_id,),
         )
         service = await cursor.fetchone()
+        cursor = await db.execute(
+            "SELECT vip_until FROM users WHERE user_id = ?",
+            (callback.from_user.id,),
+        )
+        user_row = await cursor.fetchone()
     if service is None:
         await callback.answer("Hizmet artik aktif degil.", show_alert=True)
         return
+    vip_active = False
+    if user_row and user_row["vip_until"]:
+        try:
+            vip_active = datetime.fromisoformat(user_row["vip_until"]) > now_utc()
+        except ValueError:
+            vip_active = False
     description = clean_text(service["description"], 180)
-    text = (
-        clean_text(service["name"], 80)
-        + "\n"
-        + description
-        + "\nFiyat: "
-        + format_money(service["price_cents"])
-    )
+    price = int(service["price_cents"])
+    text = clean_text(service["name"], 80) + "\n" + description
+    if vip_active:
+        vip_price = int(price * 80 // 100)
+        text += "\nNormal fiyat: " + format_money(price)
+        text += "\n💎 VIP fiyat: " + format_money(vip_price) + " (%20 indirim)"
+    else:
+        text += "\nFiyat: " + format_money(price)
     if callback.message:
         await callback.message.answer(
             text,
@@ -1825,9 +1830,22 @@ async def buy_service_handler(callback: CallbackQuery):
         await callback.answer("Hizmet bulunamadi.", show_alert=True)
         return
     await ensure_user(callback.from_user)
+    async with db_session() as db:
+        cursor = await db.execute(
+            "SELECT vip_until FROM users WHERE user_id = ?",
+            (callback.from_user.id,),
+        )
+        user_row = await cursor.fetchone()
+    vip_active = False
+    if user_row and user_row["vip_until"]:
+        try:
+            vip_active = datetime.fromisoformat(user_row["vip_until"]) > now_utc()
+        except ValueError:
+            vip_active = False
     result, order = await create_order(
         callback.from_user.id,
         service_id,
+        vip_discount=vip_active,
     )
     if result == "missing":
         await callback.answer("Hizmet artik aktif degil.", show_alert=True)
@@ -1843,18 +1861,18 @@ async def buy_service_handler(callback: CallbackQuery):
         [
             "Siparis #" + str(order_id) + " olusturuldu.",
             "Hizmet: " + clean_text(order["service_name"], 80),
-            "Rezerve edilen tutar: "
-            + format_money(order["amount_cents"]),
+            "Rezerve edilen tutar: " + format_money(order["amount_cents"]),
             "Iptal suresi: 6 dakika.",
-            "Yonetici once numara sonra kodu manuel gonderecek.",
+            "⚡ Teslimat: Otomatik",
         ]
     )
+    if vip_active:
+        body += "\n💎 VIP: %20 indirim + oncelikli islem"
     if callback.message:
         await callback.message.answer(
             body,
             reply_markup=order_keyboard(order_id),
         )
-
     try:
         initial = render_spinner_frame(0, "-----")
         anim_msg = await callback.bot.send_message(
@@ -1877,14 +1895,13 @@ async def buy_service_handler(callback: CallbackQuery):
         )
     except TelegramAPIError:
         logger.exception("Could not start animation")
-
     admin_body = "\n".join(
         [
-            "Yeni siparis #" + str(order_id),
+            ("⭐ VIP " if vip_active else "") + "Yeni siparis #" + str(order_id),
             "Kullanici: " + str(callback.from_user.id),
             "Hizmet: " + clean_text(order["service_name"], 80),
             "Tutar: " + format_money(order["amount_cents"]),
-            "Once '📱 Numara Gir' butonuna basin.",
+            "Numara ve kod girmek icin butona basin.",
         ]
     )
     await notify_admins(
@@ -1894,7 +1911,7 @@ async def buy_service_handler(callback: CallbackQuery):
     )
     await log_event(
         callback.bot,
-        "Yeni siparis #"
+        ("VIP " if vip_active else "") + "Yeni siparis #"
         + str(order_id)
         + " | kullanici "
         + str(callback.from_user.id)
@@ -1956,7 +1973,6 @@ async def receive_phone_handler(message: Message, state: FSMContext):
     if order_id <= 0:
         await message.answer("Siparis bulunamadi.")
         return
-
     async with db_session() as db:
         cursor = await db.execute(
             "SELECT * FROM orders WHERE order_id = ?",
@@ -1966,7 +1982,6 @@ async def receive_phone_handler(message: Message, state: FSMContext):
     if order is None or order["status"] != "pending":
         await message.answer("Siparis artik beklemiyor.")
         return
-
     user_id = int(order["user_id"])
     ORDER_PHONE_CACHE[order_id] = phone
     stop_order_animation(order_id)
@@ -2047,7 +2062,6 @@ async def receive_code_handler(message: Message, state: FSMContext):
     if order_id <= 0:
         await message.answer("Siparis bulunamadi.")
         return
-
     async with db_session() as db:
         cursor = await db.execute(
             "SELECT * FROM orders WHERE order_id = ?",
@@ -2057,7 +2071,6 @@ async def receive_code_handler(message: Message, state: FSMContext):
     if order is None or order["status"] != "pending":
         await message.answer("Siparis artik beklemiyor.")
         return
-
     user_id = int(order["user_id"])
     phone = ORDER_PHONE_CACHE.pop(order_id, "")
     ref = ORDER_MESSAGE_REFS.pop(order_id, None)
@@ -2072,12 +2085,10 @@ async def receive_code_handler(message: Message, state: FSMContext):
             )
         except TelegramAPIError:
             pass
-
     result, completed = await complete_order(order_id)
     if result != "completed":
         await message.answer("Siparis tamamlanamadi.")
         return
-
     await notify_user(
         message.bot,
         user_id,
@@ -2245,7 +2256,7 @@ def topup_keyboard():
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="🏦 Banka havalesi (fiziksel/offline)",
+                    text="🏦 Banka havalesi",
                     callback_data="bankdeposit",
                     style="primary",
                 )
@@ -2261,8 +2272,7 @@ async def show_topup_methods(message):
     keyboard = topup_keyboard()
     if keyboard is None:
         await message.answer(
-            "Bakiye yukleme henuz ayarlanmamis. "
-            "Yonetici Railway'de STAR_TOPUP_TIERS degerini tanimlamali."
+            "Bakiye yukleme henuz ayarlanmamis."
         )
         return
     text = (
@@ -2297,8 +2307,6 @@ async def bank_deposit_start(
     await state.set_state(DepositFlow.amount)
     if callback.message:
         await callback.message.answer(
-            "Bu havale secenegini yalnizca Telegram disinda teslim edilen "
-            "fiziksel/offline urun ve hizmetler icin kullanin.\n\n"
             "Yuklemek istediginiz tutari TL olarak yazin.\n\n"
             + PAYMENT_INSTRUCTIONS
         )
@@ -2377,7 +2385,7 @@ async def create_star_invoice_handler(callback: CallbackQuery):
             await db.commit()
         logger.exception("Could not create Telegram Stars invoice")
         await callback.answer(
-            "Stars odemesi baslatilamadi. Daha sonra yeniden deneyin.",
+            "Stars odemesi baslatilamadi.",
             show_alert=True,
         )
         return
@@ -2407,7 +2415,7 @@ async def pre_checkout_handler(query: PreCheckoutQuery):
         ok=valid,
         error_message=None
         if valid
-        else "Bu odeme faturasi artik gecerli degil. Yeni bir fatura isteyin.",
+        else "Bu odeme faturasi artik gecerli degil.",
     )
 
 
@@ -2449,12 +2457,10 @@ async def successful_payment_handler(message: Message):
                 message.bot,
                 "Dogrulanamayan Telegram Stars odemesi alindi.\n"
                 + "Kullanici: "
-                + str(message.from_user.id)
-                + "\nPayload: "
-                + clean_text(payment.invoice_payload, 100),
+                + str(message.from_user.id),
             )
             await message.answer(
-                "Odeme dogrulanamadi. Lutfen yoneticiyle iletisime gecin."
+                "Odeme dogrulanamadi."
             )
             return
         credit_cents = int(intent["credit_cents"])
@@ -2473,7 +2479,7 @@ async def successful_payment_handler(message: Message):
         if cursor.rowcount != 1:
             await db.rollback()
             await message.answer(
-                "Bu odeme daha once islenmis. Bakiye hareketlerinizi kontrol edin."
+                "Bu odeme daha once islenmis."
             )
             return
         await db.execute(
@@ -2538,7 +2544,7 @@ async def deposit_reference_input(message: Message, state: FSMContext):
     amount = int(data.get("amount_cents", 0))
     if amount <= 0:
         await state.clear()
-        await message.answer("Talep olusturulamadi. Yeniden deneyin.")
+        await message.answer("Talep olusturulamadi.")
         return
     async with db_session() as db:
         cursor = await db.execute(
@@ -2617,9 +2623,7 @@ async def deposit_action_handler(callback: CallbackQuery):
             "Bakiye talebi onaylandi: #"
             + str(deposit_id)
             + " | admin "
-            + str(callback.from_user.id)
-            + " | "
-            + format_money(deposit["amount_cents"]),
+            + str(callback.from_user.id),
         )
         await callback.answer("Bakiye eklendi.")
     else:
@@ -2631,9 +2635,7 @@ async def deposit_action_handler(callback: CallbackQuery):
         await log_event(
             callback.bot,
             "Bakiye talebi reddedildi: #"
-            + str(deposit_id)
-            + " | admin "
-            + str(callback.from_user.id),
+            + str(deposit_id),
         )
         await callback.answer("Talep reddedildi.")
 
@@ -2658,15 +2660,12 @@ async def start_admin_balance_flow(message, state, operation):
         await message.answer(
             "Tam kullanim: /"
             + ("addbalance" if operation == "add" else "removebalance")
-            + " @kullanici_adi_veya_id tutar\n"
-            "Adim adim islem icin komutu tek basina gonderin."
+            + " @kullanici_adi_veya_id tutar"
         )
         return
     user_id = await resolve_user_id(parts[1])
     if user_id is None:
-        await message.answer(
-            "Kullanici bulunamadi. Kullanici botu en az bir kez baslatmis olmali."
-        )
+        await message.answer("Kullanici bulunamadi.")
         return
     try:
         amount = parse_money(parts[2])
@@ -2772,7 +2771,7 @@ async def apply_admin_balance_change(message, user_id, amount, operation):
         (
             "Hesabiniza "
             + format_money(amount)
-            + " eklendi. Yeni bakiyenizi /balance ile gorebilirsiniz."
+            + " eklendi."
             if is_add
             else "Bakiyenizden " + format_money(amount) + " dusuldu."
         ),
@@ -2802,8 +2801,7 @@ async def add_service_handler(message: Message, state: FSMContext):
     parts = args.split("|", 2)
     if len(parts) < 2:
         await message.answer(
-            "Tam kullanim: /addservice isim|fiyat|aciklama\n"
-            "Sihirbaz icin yalnizca /addservice yazin."
+            "Tam kullanim: /addservice isim|fiyat|aciklama"
         )
         return
     name = clean_text(parts[0], 60)
@@ -2877,7 +2875,7 @@ async def service_wizard_price(message: Message, state: FSMContext):
         return
     await state.update_data(service_price_cents=price)
     await state.set_state(AdminServiceFlow.description)
-    await message.answer("Kisa aciklamayi yazin. Aciklama istemiyorsaniz - gonderin.")
+    await message.answer("Kisa aciklamayi yazin. - gonderirseniz bos.")
 
 
 @router.message(AdminServiceFlow.description)
@@ -3015,9 +3013,7 @@ async def finish_promo_creation(
         + " | bonus "
         + format_money(bonus_cents)
         + " | kullanim "
-        + str(max_uses)
-        + " | admin "
-        + str(message.from_user.id if message.from_user else 0),
+        + str(max_uses),
     )
 
 
@@ -3034,8 +3030,7 @@ async def add_promo_handler(message: Message, state: FSMContext):
         return
     if len(parts) != 5:
         await message.answer(
-            "Tam komut: /promoadd KOD bonus kullanim dakika\n"
-            "Sihirbaz icin yalnizca /promoadd yazin."
+            "Tam komut: /promoadd KOD bonus kullanim dakika"
         )
         return
     code = parts[1].upper()
@@ -3083,7 +3078,7 @@ async def promo_wizard_code(message: Message, state: FSMContext):
         return
     await state.update_data(promo_code=code)
     await state.set_state(AdminPromoFlow.bonus)
-    await message.answer("Kac TL bonus verecek? Ornek: 30 veya 30,50")
+    await message.answer("Kac TL bonus verecek?")
 
 
 @router.message(AdminPromoFlow.bonus)
@@ -3110,7 +3105,7 @@ async def promo_wizard_uses(message: Message, state: FSMContext):
         return
     value = (message.text or "").strip()
     if not value.isdigit() or not 1 <= int(value) <= 100_000:
-        await message.answer("Kullanim siniri 1-100000 araliginda tam sayi olmali.")
+        await message.answer("Kullanim siniri 1-100000 araliginda olmali.")
         return
     await state.update_data(promo_max_uses=int(value))
     await state.set_state(AdminPromoFlow.duration_minutes)
@@ -3125,7 +3120,7 @@ async def promo_wizard_duration(message: Message, state: FSMContext):
         return
     value = (message.text or "").strip()
     if not value.isdigit() or not 1 <= int(value) <= 525_600:
-        await message.answer("Sure 1-525600 dakika araliginda tam sayi olmali.")
+        await message.answer("Sure 1-525600 dakika araliginda olmali.")
         return
     data = await state.get_data()
     await state.clear()
@@ -3149,10 +3144,7 @@ async def deactivate_promo(message, code):
         await message.answer("Promo kapatildi.")
         await log_event(
             message.bot,
-            "Promo kapatildi: "
-            + code.upper()
-            + " | admin "
-            + str(message.from_user.id if message.from_user else 0),
+            "Promo kapatildi: " + code.upper(),
         )
     else:
         await message.answer("Aktif promo bulunamadi.")
@@ -3216,9 +3208,7 @@ async def user_info_handler(message: Message):
         user = await cursor.fetchone()
         if user:
             cursor = await db.execute(
-                """
-                SELECT COUNT(*) AS total FROM orders WHERE user_id = ?
-                """,
+                "SELECT COUNT(*) AS total FROM orders WHERE user_id = ?",
                 (user_id,),
             )
             orders = await cursor.fetchone()
@@ -3230,8 +3220,7 @@ async def user_info_handler(message: Message):
             [
                 "Kullanici: " + str(user["user_id"]),
                 "Ad: " + clean_text(user["first_name"], 100),
-                "Kullanici adi: "
-                + clean_text(user["username"] or "-", 64),
+                "Kullanici adi: " + clean_text(user["username"] or "-", 64),
                 "Bakiye: " + format_money(user["balance_cents"]),
                 "Siparis: " + str(orders["total"]),
                 "Kayit: " + user["created_at"],
@@ -3280,10 +3269,7 @@ async def stats_handler(message: Message):
         )
         pending = await cursor.fetchone()
         cursor = await db.execute(
-            """
-            SELECT COALESCE(SUM(amount_cents), 0) AS total
-            FROM orders WHERE status = 'completed'
-            """
+            "SELECT COALESCE(SUM(amount_cents), 0) AS total FROM orders WHERE status = 'completed'"
         )
         sales = await cursor.fetchone()
         cursor = await db.execute(
@@ -3296,8 +3282,7 @@ async def stats_handler(message: Message):
                 "Kullanici: " + str(users["total"]),
                 "Bekleyen siparis: " + str(pending["total"]),
                 "Aktif hizmet: " + str(services["total"]),
-                "Tamamlanan siparis tutari: "
-                + format_money(sales["total"]),
+                "Tamamlanan siparis tutari: " + format_money(sales["total"]),
             ]
         )
     )
@@ -3326,12 +3311,11 @@ async def fallback_handler(message: Message):
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError(
-            "BOT_TOKEN is missing. Set the token as a Railway Variable; "
-            "do not put it in the source code."
+            "BOT_TOKEN is missing."
         )
     if not ADMIN_IDS:
         raise RuntimeError(
-            "Set ADMIN_IDS in Railway Variables to one or more Telegram user IDs."
+            "Set ADMIN_IDS in Railway Variables."
         )
     log_level = getattr(
         logging,
