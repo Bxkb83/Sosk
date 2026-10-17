@@ -23,6 +23,17 @@ from aiogram.types import (
     PreCheckoutQuery,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    User,
+)
+from bot_extensions import (
+    AdminBroadcastFlow,
+    init_feature_schema,
+    get_language,
+    leaderboard_handler,
+    order_rating_keyboard,
+    router as extensions_router,
+    SupportFlow,
+    user_is_banned,
 )
 
 
@@ -38,10 +49,12 @@ STAR_TOPUP_TIERS_RAW = os.getenv("STAR_TOPUP_TIERS", "").strip()
 FORCE_JOIN_CHANNEL = os.getenv("FORCE_JOIN_CHANNEL", "").strip()
 JOIN_CHANNEL_URL = os.getenv("JOIN_CHANNEL_URL", "").strip()
 LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "").strip()
+PROMO_CHANNEL_ID = os.getenv("PROMO_CHANNEL_ID", "").strip()
 CANCEL_SECONDS = 6 * 60
 DAILY_REWARD_CENTS = 100
 MAX_AMOUNT_CENTS = 100_000_000
 router = Router()
+fallback_router = Router(name="store-fallback")
 logger = logging.getLogger("service-order-bot")
 
 
@@ -101,9 +114,69 @@ class AdminDeleteServiceFlow(StatesGroup):
     service_id = State()
 
 
+class AdminDeliveryFlow(StatesGroup):
+    note = State()
+
+
 class AdminEnterNumberFlow(StatesGroup):
     phone = State()
     code = State()
+
+
+ORDER_ANIMATIONS = {}
+ORDER_MESSAGE_REFS = {}
+ORDER_PHONE_CACHE = {}
+BULLET_CHAR = "\u2022"
+
+SPINNER_POSITIONS = [
+    (0, 0), (0, 1), (0, 2), (0, 3), (0, 4),
+    (1, 4), (2, 4), (3, 4),
+    (4, 4), (4, 3), (4, 2), (4, 1), (4, 0),
+    (3, 0), (2, 0), (1, 0),
+]
+
+
+def render_spinner_frame(step, center_text):
+    missing = SPINNER_POSITIONS[step % 16]
+    lines = []
+    for r in range(5):
+        row_chars = []
+        for c in range(5):
+            is_border = (r == 0 or r == 4 or c == 0 or c == 4)
+            if is_border:
+                if (r, c) == missing:
+                    row_chars.append(" ")
+                else:
+                    row_chars.append(BULLET_CHAR)
+            else:
+                row_chars.append(" ")
+        lines.append(" ".join(row_chars))
+    lines[2] = "  " + center_text
+    body = "\n".join(lines)
+    return "<pre>" + body + "</pre>"
+
+
+def stop_order_animation(order_id):
+    ORDER_ANIMATIONS.pop(order_id, None)
+
+
+async def animate_order_status(bot, chat_id, message_id, order_id):
+    step = 0
+    try:
+        while order_id in ORDER_ANIMATIONS:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=render_spinner_frame(step, "-----"),
+                    parse_mode="HTML",
+                )
+            except TelegramAPIError:
+                pass
+            step += 1
+            await asyncio.sleep(0.6)
+    except asyncio.CancelledError:
+        return
 
 
 def parse_star_topup_tiers(raw=STAR_TOPUP_TIERS_RAW):
@@ -163,6 +236,14 @@ def parse_money(value):
 
 
 try:
+    WELCOME_BONUS_CENTS = parse_money(
+        os.getenv("WELCOME_BONUS_TL", "1").strip()
+    )
+except ValueError as exc:
+    raise RuntimeError("WELCOME_BONUS_TL must be a positive TL amount.") from exc
+
+
+try:
     STAR_TOPUP_TIERS = parse_star_topup_tiers()
 except ValueError as exc:
     raise RuntimeError(str(exc)) from exc
@@ -217,14 +298,14 @@ def join_channel_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Kanala Katil",
+                    text="📣 Kanala katıl",
                     url=url,
                     style="primary",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="Katilinca Kontrol Et",
+                    text="✅ Katıldım, kontrol et",
                     callback_data="check_join",
                     style="success",
                 )
@@ -235,9 +316,31 @@ def join_channel_keyboard():
 
 class JoinChannelMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is not None and not is_admin(user.id):
+            if await user_is_banned(user.id):
+                if isinstance(event, Message):
+                    await event.answer(
+                        "🚫 Bu hesap botu kullanamıyor. "
+                        "Bir hata olduğunu düşünüyorsan yöneticiyle iletişime geç."
+                    )
+                elif isinstance(event, CallbackQuery):
+                    await event.answer(
+                        "🚫 Bu hesap botu kullanamıyor.",
+                        show_alert=True,
+                    )
+                return None
+            async with db_session() as db:
+                await db.execute(
+                    "UPDATE users SET last_seen_at = ? WHERE user_id = ?",
+                    (timestamp(), user.id),
+                )
+                await db.commit()
+        if user is None or is_admin(user.id):
+            if not FORCE_JOIN_CHANNEL:
+                return await handler(event, data)
         if not FORCE_JOIN_CHANNEL:
             return await handler(event, data)
-        user = getattr(event, "from_user", None)
         if user is None or is_admin(user.id):
             return await handler(event, data)
         if isinstance(event, Message) and event.successful_payment:
@@ -256,12 +359,20 @@ class JoinChannelMiddleware(BaseMiddleware):
 
         if joined is None:
             text = (
-                "Kanal uyeligi su anda kontrol edilemiyor. "
-                "Botun katilim kanalinda yonetici oldugunu kontrol edin."
+                "⚠️ Kanal üyeliğini şu anda kontrol edemiyorum.\n"
+                "Biraz sonra tekrar dene. Sorun sürerse bot yöneticisi "
+                "kanal ayarlarını kontrol etsin."
             )
             keyboard = None
         else:
-            text = "Botu kullanmak icin once duyuru kanalina katilin."
+            text = (
+                "👋 Hoş geldin!\n\n"
+                "Botu kullanmadan önce duyuru kanalımıza katılman gerekiyor:\n"
+                "1️⃣ “Kanala katıl” butonuna dokun.\n"
+                "2️⃣ Kanalı takip ettikten sonra “Katıldım, kontrol et” "
+                "butonuna bas.\n\n"
+                "✅ Kontrol başarılı olunca ana menü açılacak."
+            )
             keyboard = join_channel_keyboard()
 
         if isinstance(event, Message):
@@ -269,19 +380,80 @@ class JoinChannelMiddleware(BaseMiddleware):
         elif isinstance(event, CallbackQuery):
             if event.message:
                 await event.message.answer(text, reply_markup=keyboard)
-            await event.answer("Once kanala katilin.", show_alert=True)
+            await event.answer("📣 Önce duyuru kanalına katıl.", show_alert=True)
         return None
+
+
+class RateLimitMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if (
+            not isinstance(event, Message)
+            or event.from_user is None
+            or is_admin(event.from_user.id)
+            or event.successful_payment
+            or (event.text or "").strip() == "/cancel"
+        ):
+            return await handler(event, data)
+        state = data.get("state")
+        if state is not None:
+            try:
+                if await state.get_state():
+                    return await handler(event, data)
+            except Exception:
+                pass
+        user_id = event.from_user.id
+        current = now_utc()
+        current_text = current.isoformat(timespec="seconds")
+        db = await open_db()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await db.execute(
+                "SELECT last_message_at FROM message_rate_limits WHERE user_id = ?",
+                (user_id,),
+            )
+            row = await cursor.fetchone()
+            if row:
+                previous = datetime.fromisoformat(row["last_message_at"])
+                remaining = 30 - int((current - previous).total_seconds())
+                if remaining > 0:
+                    await db.rollback()
+                    await event.answer(
+                        "Guvenlik siniri: yeni mesaj icin "
+                        + str(remaining)
+                        + " saniye bekleyin."
+                    )
+                    return None
+            await db.execute(
+                """
+                INSERT INTO message_rate_limits (user_id, last_message_at)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    last_message_at = excluded.last_message_at
+                """,
+                (user_id, current_text),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+        return await handler(event, data)
 
 
 router.message.outer_middleware(JoinChannelMiddleware())
 router.callback_query.outer_middleware(JoinChannelMiddleware())
+router.message.outer_middleware(RateLimitMiddleware())
+router.include_router(extensions_router)
 
 
 async def log_event(bot, text):
+    safe_text = clean_text(text, 1800)
+    logger.info("bot_event: %s", safe_text)
     if not LOG_CHANNEL_ID:
         return
     try:
-        await bot.send_message(LOG_CHANNEL_ID, "Bot kaydi:\n" + text)
+        await bot.send_message(LOG_CHANNEL_ID, "📋 Bot kaydı:\n" + safe_text)
     except TelegramAPIError:
         logger.exception("Could not write to the configured log channel")
 
@@ -324,19 +496,142 @@ async def validate_channels(bot):
             raise RuntimeError(
                 "Bot must be an administrator in LOG_CHANNEL_ID."
             )
+    if PROMO_CHANNEL_ID:
+        try:
+            await bot.get_chat(PROMO_CHANNEL_ID)
+            membership = await bot.get_chat_member(
+                chat_id=PROMO_CHANNEL_ID,
+                user_id=me.id,
+            )
+        except TelegramAPIError as exc:
+            raise RuntimeError(
+                "Bot cannot access PROMO_CHANNEL_ID. Check the channel ID "
+                "and add the bot as an administrator."
+            ) from exc
+        if membership.status not in ("administrator", "creator"):
+            raise RuntimeError(
+                "Bot must be an administrator in PROMO_CHANNEL_ID."
+            )
     logger.info("Telegram bot connected as @%s", me.username or me.id)
 
 
-def main_keyboard(user_id):
+def main_keyboard(user_id, language="tr"):
+    english = language == "en"
+    labels = {
+        "catalog": "🛍️ Catalog" if english else "🛍️ Hizmet kataloğu",
+        "balance": "💰 Balance" if english else "💰 Bakiyem",
+        "orders": "📦 Orders" if english else "📦 Siparişlerim",
+        "topup": "⭐ Add balance" if english else "⭐ Bakiye yükle",
+        "vip": "💎 VIP membership" if english else "💎 VIP üyelik",
+        "coupon": "🎟️ Discount coupon" if english else "🎟️ İndirim kuponu",
+        "referral": "👥 Invite friends" if english else "👥 Arkadaşını davet et",
+        "leaderboard": "🏆 Invite leaders" if english else "🏆 Davet liderleri",
+        "rewards": "🎁 Rewards & tasks" if english else "🎁 Ödüller ve görevler",
+        "support": "💬 Support" if english else "💬 Destek",
+        "language": "🌐 Language" if english else "🌐 Dil seçimi",
+        "help": "ℹ️ Help" if english else "ℹ️ Yardım",
+        "announcement": "📢 Announcement" if english else "📢 Duyuru gönder",
+        "admin": "🛠️ Admin panel" if english else "🛠️ Admin paneli",
+    }
     rows = [
         [
-            KeyboardButton(text="Hizmetler", style="primary"),
-            KeyboardButton(text="Bakiye", style="success"),
+            InlineKeyboardButton(
+                text=labels["catalog"],
+                callback_data="menu:catalog",
+                style="primary",
+            ),
+            InlineKeyboardButton(
+                text=labels["balance"],
+                callback_data="menu:balance",
+                style="success",
+            ),
         ],
         [
-            KeyboardButton(text="Siparisler", style="primary"),
-            KeyboardButton(text="Bakiye Yukle", style="success"),
+            InlineKeyboardButton(
+                text=labels["orders"],
+                callback_data="menu:orders",
+                style="primary",
+            ),
+            InlineKeyboardButton(
+                text=labels["topup"],
+                callback_data="menu:topup",
+                style="success",
+            ),
         ],
+        [
+            InlineKeyboardButton(
+                text=labels["vip"],
+                callback_data="menu:vip",
+                style="success",
+            ),
+            InlineKeyboardButton(
+                text=labels["coupon"],
+                callback_data="menu:coupon",
+                style="primary",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=labels["referral"],
+                callback_data="menu:referral",
+                style="primary",
+            ),
+            InlineKeyboardButton(
+                text=labels["leaderboard"],
+                callback_data="menu:leaderboard",
+                style="success",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=labels["rewards"],
+                callback_data="menu:rewards",
+                style="primary",
+            ),
+            InlineKeyboardButton(
+                text=labels["support"],
+                callback_data="menu:support",
+                style="success",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=labels["language"],
+                callback_data="menu:language",
+                style="primary",
+            ),
+            InlineKeyboardButton(
+                text=labels["help"],
+                callback_data="menu:help",
+                style="primary",
+            )
+        ],
+    ]
+    if is_admin(user_id):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=labels["announcement"],
+                    callback_data="menu:broadcast",
+                    style="danger",
+                ),
+                InlineKeyboardButton(
+                    text=labels["admin"],
+                    callback_data="menu:admin",
+                    style="primary",
+                ),
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def language_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🇹🇷 Türkçe",
+                    callback_dat   ],
         [
             KeyboardButton(text="Promosyon", style="success"),
             KeyboardButton(text="Referans", style="primary"),
