@@ -63,6 +63,10 @@ Yeni promosyon, `PROMO_CHANNEL_ID` ayarlıysa kanala otomatik gönderilir; kulla
 
 Ek özellikler: ilk kayıt hoş geldin bonusu, davet liderlik tablosu, sayfalı sipariş/bakiye geçmişi, kullanıcılar arası bakiye transferi, destek talepleri, sipariş puanlaması, kullanıcı başına 30 saniye mesaj sınırı ve olağan dışı transfer uyarıları. Yüzde kuponları sonraki siparişe uygulanır; VIP ve flash indirimler birlikte birikmez, geçerli en yüksek indirim seçilir. Gizemli kutu ve haftalık görevler yalnızca nakde çevrilemeyen puan verir. Dil seçimi başlangıç/menü/yardım metinlerini destekler; tüm işlem mesajlarının çevirisi henüz tamamlanmamıştır. Admin broadcast ve ban/not özellikleri yalnızca `ADMIN_IDS` kullanıcılarına açıktır.
 
+`/start` ekranı kullanıcı adını, güncel bakiyeyi ve VIP durumunu gösterir; işlem butonları mesajın hemen altında açılır. Katalogda aktif genel hizmetler ve fiyatları görünür. Katalog kayıtları `/addservice` ile yönetilir. VIP, kupon, davet, görev, destek ve yönetici duyurusu menüden açılabilir. `bot_extensions.py` içindeki komutlar ana uygulamaya alt yönlendirici olarak eklenmiştir; bilinmeyen mesajlar için yedek yönlendirici bu komutların önüne geçmez. İşlem kayıtları `LOG_CHANNEL_ID` ayarlıysa Telegram log kanalına, her durumda workflow günlüklerine yazılır.
+
+Bu paket ülkeye göre sanal telefon numarası, üçüncü taraf hesap doğrulama numarası veya SMS/OTP kodu satın alma/iletme akışı içermez. Genel hizmet kataloğu bu sınırlamayı değiştirmez.
+
 Referans ödülü sadece davet edilen kullanıcının ilk siparişi admin tarafından tamamlandığında eklenir. Kayıt/sipariş verileri SQLite'ta tutulur; bot yeni bir Railway örneği veya kaybolan volume ile açılırsa yerel DB dosyası da kaybolabilir.
 
 ## Yerel kontrol
