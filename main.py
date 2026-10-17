@@ -23,6 +23,7 @@ from aiogram.types import (
     PreCheckoutQuery,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    ReplyKeyboardRemove,
     User,
 )
 from bot_extensions import (
@@ -1523,6 +1524,13 @@ async def send_pending_deposits(message):
 async def start_handler(message: Message):
     if message.from_user is None:
         return
+    try:
+        await message.answer(
+            "🔄 Ana menü hazırlanıyor...",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except TelegramAPIError:
+        pass
     await ensure_user(
         message.from_user,
         referrer_id=referral_id_from_start(message.text),
@@ -3301,9 +3309,43 @@ async def admin_handler(message: Message):
 async def fallback_handler(message: Message):
     if message.from_user is None:
         return
+    text = (message.text or "").strip()
+    if text == "Hizmetler":
+        await show_services(message)
+        return
+    if text == "Bakiye":
+        await balance_handler(message)
+        return
+    if text == "Siparişler":
+        await history_handler(message)
+        return
+    if text == "Siparişlerim":
+        await history_handler(message)
+        return
+    if text == "Bakiye Yükle":
+        await show_topup_methods(message)
+        return
+    if text == "Bakiye Yukle":
+        await show_topup_methods(message)
+        return
+    if text == "Promosyon":
+        await message.answer("Promo kodunu gonderin:")
+        return
+    if text == "Referans":
+        await referral_handler(message)
+        return
+    if text == "Yardım":
+        await help_handler(message)
+        return
+    if text == "Yardim":
+        await help_handler(message)
+        return
+    if text == "Admin Paneli":
+        await admin_handler(message)
+        return
     language = await get_language(message.from_user.id)
     await message.answer(
-        "Komut taninmadi. /help yazarak yardim alabilirsiniz.",
+        "Komut tanınmadı. /start yazarak menüyü yenileyin.",
         reply_markup=main_keyboard(message.from_user.id, language),
     )
 
