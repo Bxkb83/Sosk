@@ -72,12 +72,12 @@ async def leaderboard_handler(message: Message):
     if not rows:
         await message.answer("Liderlik tablosu henuz bos.")
         return
-    lines = ["Davet liderleri (ilk 10):"]
+    lines = ["🏆 Davet liderleri — ilk 10"]
     for rank, row in enumerate(rows, start=1):
         name = row["username"] or row["first_name"] or str(row["user_id"])
         if row["username"]:
             name = "@" + name
-        lines.append(f"{rank}. {name} — {row['invite_count']} davet")
+        lines.append(f"{rank}. {name} — 👥 {row['invite_count']} davet")
     await message.answer("\n".join(lines))
 
 
@@ -300,6 +300,287 @@ async def ticket_handler(message: Message, state: FSMContext):
     if message.from_user is None:
         return
     body = (message.text or "").partition(" ")[2].strip()
+    if not body:
+        await state.set_state(SupportFlow.body)
+        await message.answer("Destek talebinizi yazin. Iptal icin /cancel.")
+        return
+    await create_ticket(message, body)
+
+
+async def create_ticket(message, body):
+    if message.from_user is None:
+        return
+    body = " ".join(body.split())[:3000]
+    if len(body) < 4:
+        await message.answer("Destek talebiniz en az 4 karakter olmali.")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO support_tickets (user_id, body, status, created_at)
+            VALUES (?, ?, 'open', ?)
+            """,
+            (message.from_user.id, body, timestamp()),
+        )
+        ticket_id = cursor.lastrowid
+        await db.commit()
+    await message.answer(f"Destek talebiniz alindi. Talep numarasi: #{ticket_id}")
+    for admin_id in admin_ids():
+        try:
+            await message.bot.send_message(
+                admin_id,
+                f"Yeni destek talebi #{ticket_id}\n"
+                f"Kullanici: {message.from_user.id}\n{body[:1200]}",
+            )
+        except TelegramAPIError:
+            continue
+
+
+@router.message(SupportFlow.body)
+async def ticket_body_handler(message: Message, state: FSMContext):
+    await state.clear()
+    await create_ticket(message, message.text or "")
+
+
+@router.message(Command("tickets"))
+async def tickets_handler(message: Message):
+    if message.from_user is None or not is_admin(message.from_user.id):
+        await message.answer("Yetkiniz yok.")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT ticket_id, user_id, body, created_at
+            FROM support_tickets WHERE status = 'open'
+            ORDER BY ticket_id LIMIT 20
+            """
+        )
+        rows = await cursor.fetchall()
+    if not rows:
+        await message.answer("Acik destek talebi yok.")
+        return
+    for row in rows:
+        await message.answer(
+            f"Talep #{row['ticket_id']} | Kullanici {row['user_id']}\n"
+            f"{row['created_at']}\n{row['body'][:2500]}"
+        )
+
+
+@router.message(Command("ticketreply"))
+async def ticket_reply_handler(message: Message):
+    if message.from_user is None or not is_admin(message.from_user.id):
+        await message.answer("Yetkiniz yok.")
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) != 3 or not parts[1].isdigit():
+        await message.answer("Kullanim: /ticketreply TALEP_ID YANIT")
+        return
+    ticket_id, body = int(parts[1]), " ".join(parts[2].split())[:3000]
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT user_id FROM support_tickets WHERE ticket_id = ? AND status = 'open'",
+            (ticket_id,),
+        )
+        ticket = await cursor.fetchone()
+    if ticket is None:
+        await message.answer("Acik destek talebi bulunamadi.")
+        return
+    try:
+        await message.bot.send_message(
+            int(ticket["user_id"]),
+            f"Destek ekibinden yanit (talep #{ticket_id}):\n{body}",
+        )
+    except TelegramAPIError:
+        await message.answer("Kullaniciya mesaj gonderilemedi.")
+        return
+    await message.answer(f"Yanit talep #{ticket_id} icin gonderildi.")
+
+
+@router.message(Command("ticketclose"))
+async def ticket_close_handler(message: Message):
+    if message.from_user is None or not is_admin(message.from_user.id):
+        await message.answer("Yetkiniz yok.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Kullanim: /ticketclose TALEP_ID")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE support_tickets
+            SET status = 'closed', closed_at = ?
+            WHERE ticket_id = ? AND status = 'open'
+            """,
+            (timestamp(), int(parts[1])),
+        )
+        await db.commit()
+    await message.answer(
+        "Destek talebi kapatildi." if cursor.rowcount else "Acik talep bulunamadi."
+    )
+
+
+@router.message(Command("ban"))
+async def ban_handler(message: Message):
+    if message.from_user is None or not is_admin(message.from_user.id):
+        await message.answer("Yetkiniz yok.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Kullanim: /ban KULLANICI_ID")
+        return
+    user_id = int(parts[1])
+    if is_admin(user_id):
+        await message.answer("Admin hesabi banlanamaz.")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE users SET is_banned = 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        await db.commit()
+    await message.answer(
+        f"Kullanici {user_id} banlandi."
+        if cursor.rowcount
+        else "Kullanici bulunamadi."
+    )
+
+
+@router.message(Command("unban"))
+async def unban_handler(message: Message):
+    if message.from_user is None or not is_admin(message.from_user.id):
+        await message.answer("Yetkiniz yok.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Kullanim: /unban KULLANICI_ID")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE users SET is_banned = 0 WHERE user_id = ?",
+            (int(parts[1]),),
+        )
+        await db.commit()
+    await message.answer(
+        "Ban kaldirildi." if cursor.rowcount else "Kullanici bulunamadi."
+    )
+
+
+@router.message(Command("usernote"))
+async def user_note_handler(message: Message):
+    if message.from_user is None or not is_admin(message.from_user.id):
+        await message.answer("Yetkiniz yok.")
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) != 3 or not parts[1].isdigit():
+        await message.answer("Kullanim: /usernote KULLANICI_ID NOT")
+        return
+    user_id, note = int(parts[1]), " ".join(parts[2].split())[:1000]
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        if await cursor.fetchone() is None:
+            await message.answer("Kullanici bulunamadi.")
+            return
+        await db.execute(
+            """
+            INSERT INTO admin_user_notes (user_id, admin_id, note, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, message.from_user.id, note, timestamp()),
+        )
+        await db.commit()
+    await message.answer(f"Kullanici {user_id} icin admin notu kaydedildi.")
+
+
+class AdminBroadcastFlow(StatesGroup):
+    body = State()
+    confirmation = State()
+
+
+@router.message(Command("broadcast"))
+async def broadcast_start_handler(message: Message, state: FSMContext):
+    if message.from_user is None or not is_admin(message.from_user.id):
+        await message.answer("Yetkiniz yok.")
+        return
+    body = (message.text or "").partition(" ")[2].strip()
+    if body:
+        await show_broadcast_confirmation(message, state, body)
+        return
+    await state.set_state(AdminBroadcastFlow.body)
+    await message.answer(
+        "📢 Duyuru metnini gönderin. Göndermeden önce önizleme ve onay "
+        "ekranı açılacak. İptal için /cancel yazın."
+    )
+
+
+async def show_broadcast_confirmation(message, state, body):
+    body = body.strip()
+    if not body or len(body) > 3500:
+        await message.answer("Mesaj 1-3500 karakter olmali.")
+        return
+    await state.update_data(broadcast_body=body)
+    await state.set_state(AdminBroadcastFlow.confirmation)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📢 Tüm kullanıcılara gönder",
+                    callback_data="broadcast:send",
+                    style="danger",
+                ),
+                InlineKeyboardButton(
+                    text="↩️ İptal",
+                    callback_data="broadcast:cancel",
+                    style="primary",
+                ),
+            ]
+        ]
+    )
+    await message.answer(
+        "👀 Duyuru önizlemesi:\n\n" + body,
+        reply_markup=keyboard,
+    )
+
+
+@router.message(AdminBroadcastFlow.body)
+async def broadcast_body_handler(message: Message, state: FSMContext):
+    if message.from_user is None or not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    await show_broadcast_confirmation(message, state, message.text or "")
+
+
+@router.callback_query(F.data.startswith("broadcast:"))
+async def broadcast_action_handler(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user is None or not is_admin(callback.from_user.id):
+        await callback.answer("Yetkiniz yok.", show_alert=True)
+        return
+    action = (callback.data or "").split(":", maxsplit=1)[-1]
+    if action == "cancel":
+        await state.clear()
+        await callback.answer("Duyuru iptal edildi.")
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        return
+    if action != "send" or await state.get_state() != AdminBroadcastFlow.confirmation.state:
+        await callback.answer("Onay gecersiz.", show_alert=True)
+        return
+    body = str((await state.get_data()).get("broadcast_body", ""))
+    await state.clear()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_id FROM users WHERE is_banned = 0 ORDER BY user_id"
+        )
+        rows = await cursor.fetchall()
+    sent = failed = 0
+    for row in rows:
+        try:
+            await cr "").partition(" ")[2].strip()
     if not body:
         await state.set_state(SupportFlow.body)
         await message.answer("Destek talebinizi yazin. Iptal icin /cancel.")
