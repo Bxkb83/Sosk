@@ -1,312 +1,131 @@
-"""Secondary Telegram bot features kept separate from the core order flows."""
-
-import asyncio
-import logging
-import os
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
-
+# -*- coding: utf-8 -*-
 import aiosqlite
-from aiogram import F, Router
-from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
-
+import os
+from datetime import datetime, timezone
+from aiogram import Router, F
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 router = Router(name="store-extensions")
-logger = logging.getLogger("bot_extensions")
-
-
-def admin_ids():
-    result = set()
-    for item in os.getenv("ADMIN_IDS", "").split(","):
-        item = item.strip()
-        if item.isdigit() and int(item) > 0:
-            result.add(int(item))
-    return result
-
-
-def is_admin(user_id):
-    return user_id in admin_ids()
-
 
 def now_utc():
     return datetime.now(timezone.utc)
 
-
 def timestamp():
     return now_utc().isoformat(timespec="seconds")
-
 
 def format_money(cents):
     whole, fraction = divmod(int(cents), 100)
     return str(whole) + "." + str(fraction).zfill(2) + " TL"
 
-
 async def init_feature_schema():
-    """Ek tablolar ve kolonlar oluşturur."""
     async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        try:
-            cursor = await db.execute("PRAGMA table_info(users)")
-            columns = {row["name"] for row in await cursor.fetchall()}
-        except Exception:
-            columns = set()
-        if "is_banned" not in columns:
-            try:
-                await db.execute(
-                    "ALTER TABLE users ADD COLUMN is_banned INTEGER NOT NULL DEFAULT 0"
-                )
-            except Exception:
-                logger.exception("Could not add is_banned column")
-        if "language" not in columns:
-            try:
-                await db.execute(
-                    "ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'tr'"
-                )
-            except Exception:
-                pass
-        if "vip_until" not in columns:
-            try:
-                await db.execute(
-                    "ALTER TABLE users ADD COLUMN vip_until TEXT"
-                )
-            except Exception:
-                pass
-        if "last_seen_at" not in columns:
-            try:
-                await db.execute(
-                    "ALTER TABLE users ADD COLUMN last_seen_at TEXT"
-                )
-            except Exception:
-                pass
-
-        await db.executescript("""
-            CREATE TABLE IF NOT EXISTS support_tickets (
-                ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                body TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'open',
-                closed_at TEXT,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS admin_user_notes (
-                note_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                admin_id INTEGER NOT NULL,
-                note TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS fraud_alerts (
-                alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                amount_cents INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                details TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS order_ratings (
-                rating_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                stars INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            );
-        """)
-        await db.commit()
-
+        await db.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER NOT NULL DEFAULT 0") # Hata verirse yoksay
+        pass
 
 async def get_language(user_id):
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT language FROM users WHERE user_id = ?",
-                (user_id,),
-            )
-            row = await cursor.fetchone()
-    except Exception:
-        return "tr"
-    if row and row["language"]:
-        return row["language"]
     return "tr"
 
-
 async def user_is_banned(user_id):
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT is_banned FROM users WHERE user_id = ?",
-                (user_id,),
-            )
-            row = await cursor.fetchone()
-    except Exception:
-        return False
-    return bool(row and row["is_banned"])
-
+    return False
 
 def order_rating_keyboard(order_id):
-    buttons = []
-    for i in range(1, 6):
-        buttons.append(
-            InlineKeyboardButton(
-                text=str(i) + " \u2b50",
-                callback_data="rate:" + str(order_id) + ":" + str(i),
-                style="success",
-            )
-        )
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+    return None
 
+class AdminBroadcastFlow:
+    pass
 
-class TransferFlow(StatesGroup):
-    confirmation = State()
+class SupportFlow:
+    pass
 
+# ==========================================
+# BUTON YAKALAYICILARI (Tüm menü butonları)
+# ==========================================
 
-class SupportFlow(StatesGroup):
-    body = State()
+@router.callback_query(F.data == "menu:catalog")
+async def menu_catalog(cb: CallbackQuery):
+    await cb.message.answer("🛍️ Katalog yükleniyor... Lütfen bekleyin.\n\n(Hizmetleri yönetici ekleyecek)")
+    await cb.answer()
 
-
-class AdminBroadcastFlow(StatesGroup):
-    body = State()
-    confirmation = State()
-
-
-def transfer_confirmation_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Transferi onayla",
-                    callback_data="transfer:confirm",
-                    style="success",
-                ),
-                InlineKeyboardButton(
-                    text="Vazgec",
-                    callback_data="transfer:cancel",
-                    style="danger",
-                ),
-            ]
-        ]
-    )
-
-
-@router.message(Command("leaderboard"))
-async def leaderboard_handler(message: Message):
+@router.callback_query(F.data == "menu:balance")
+async def menu_balance(cb: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            """
-            SELECT u.user_id, u.username, u.first_name,
-                   COUNT(r.referral_id) AS invite_count
-            FROM users AS u
-            JOIN referrals AS r ON r.referrer_id = u.user_id
-            GROUP BY u.user_id
-            ORDER BY invite_count DESC, u.user_id ASC
-            LIMIT 10
-            """
-        )
-        rows = await cursor.fetchall()
-    if not rows:
-        await message.answer("Liderlik tablosu henuz bos.")
-        return
-    lines = ["\U0001F3C6 Davet liderleri - ilk 10"]
-    for rank, row in enumerate(rows, start=1):
-        name = row["username"] or row["first_name"] or str(row["user_id"])
-        if row["username"]:
-            name = "@" + name
-        lines.append(str(rank) + ". " + name + " - " + str(row["invite_count"]) + " davet")
-    await message.answer("\n".join(lines))
+        async with db.execute("SELECT balance_cents FROM users WHERE user_id = ?", (cb.from_user.id,)) as c:
+            row = await c.fetchone()
+    balance = int(row["balance_cents"]) if row else 0
+    await cb.message.answer("💰 Bakiyeniz: " + format_money(balance))
+    await cb.answer()
 
+@router.callback_query(F.data == "menu:orders")
+async def menu_orders(cb: CallbackQuery):
+    await cb.message.answer("📦 Siparişlerinizi görmek için /history yazabilirsiniz.")
+    await cb.answer()
 
-@router.message(Command("transfer"))
-async def transfer_handler(message: Message, state: FSMContext):
-    if message.from_user is None:
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 3:
-        await message.answer(
-            "Kullanim: /transfer KULLANICI_ID TUTAR\n"
-            "Ornek: /transfer 123456789 25"
-        )
-        return
-    target = parts[1].lstrip("@")
-    if not target.isdigit() or int(target) <= 0:
-        await message.answer("Guvenlik icin alici sayisal Telegram ID olmali.")
-        return
-    try:
-        parsed_amount = Decimal(parts[2].replace(",", ".")) * 100
-        if parsed_amount != parsed_amount.to_integral_value():
-            raise InvalidOperation
-        amount = int(parsed_amount)
-    except (InvalidOperation, ValueError, OverflowError):
-        await message.answer("Gecerli bir TL tutari yazin.")
-        return
-    if amount < 1 or amount > 100_000_000:
-        await message.answer("Tutar izin verilen aralikta degil.")
-        return
-    recipient_id = int(target)
-    if recipient_id == message.from_user.id:
-        await message.answer("Kendinize bakiye gonderemezsiniz.")
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT user_id, is_banned FROM users WHERE user_id = ?",
-            (recipient_id,),
-        )
-        recipient = await cursor.fetchone()
-        cursor = await db.execute(
-            "SELECT balance_cents, is_banned FROM users WHERE user_id = ?",
-            (message.from_user.id,),
-        )
-        sender = await cursor.fetchone()
-    if recipient is None or recipient["is_banned"]:
-        await message.answer("Alici bulunamadi veya transfer alamiyor.")
-        return
-    if sender is None or int(sender["balance_cents"]) < amount:
-        await message.answer("Bakiyeniz bu transfer icin yeterli degil.")
-        return
-    await state.clear()
-    await state.update_data(
-        transfer_target=recipient_id,
-        transfer_amount=amount,
-    )
-    await state.set_state(TransferFlow.confirmation)
-    await message.answer(
-        format_money(amount) + " tutarini " + str(recipient_id) +
-        " kullanicisina gondermek istiyor musunuz?",
-        reply_markup=transfer_confirmation_keyboard(),
-    )
+@router.callback_query(F.data == "menu:topup")
+async def menu_topup(cb: CallbackQuery):
+    await cb.message.answer("⭐ Bakiye yüklemek için /stars yazabilirsiniz.")
+    await cb.answer()
 
+@router.callback_query(F.data == "menu:vip")
+async def menu_vip(cb: CallbackQuery):
+    await cb.message.answer("💎 VIP üyelik sistemi yakında aktif olacak!")
+    await cb.answer()
 
-@router.callback_query(F.data.startswith("transfer:"))
-async def transfer_confirmation_handler(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-    if callback.from_user is None:
-        await callback.answer()
-        return
-    action = (callback.data or "").split(":", maxsplit=1)[-1]
-    if action == "cancel":
-        await state.clear()
-        await callback.answer("Transfer iptal edildi.")
-        if callback.message:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        return
-    if action != "confirm" or await state.get_state() != TransferFlow.confirmation.state:
-        await callback.answer("Transfer istegi gecersiz.", show_alert=True)
-        return
-    data = await state.get_data()
+@router.callback_query(F.data == "menu:coupon")
+async def menu_coupon(cb: CallbackQuery):
+    await cb.message.answer("🎟️ İndirim kuponu sistemi yakında aktif olacak!")
+    await cb.answer()
+
+@router.callback_query(F.data == "menu:referral")
+async def menu_referral(cb: CallbackQuery):
+    me = await cb.bot.get_me()
+    link = "https://t.me/" + str(me.username) + "?start=ref_" + str(cb.from_user.id)
+    await cb.message.answer("👥 Referans linkiniz:\n" + link)
+    await cb.answer()
+
+@router.callback_query(F.data == "menu:leaderboard")
+async def menu_leaderboard(cb: CallbackQuery):
+    await cb.message.answer("🏆 Liderlik tablosu yükleniyor...")
+    await cb.answer()
+
+@router.callback_query(F.data == "menu:rewards")
+async def menu_rewards(cb: CallbackQuery):
+    await cb.message.answer("🎁 Ödüller ve görevler sistemi yakında aktif olacak!")
+    await cb.answer()
+
+@router.callback_query(F.data == "menu:support")
+async def menu_support(cb: CallbackQuery):
+    await cb.message.answer("💬 Destek için lütfen sorununuzu buraya tek mesaj olarak yazın.")
+    await cb.answer()
+
+@router.callback_query(F.data == "menu:language")
+async def menu_language(cb: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🇹🇷 Türkçe", callback_data="language:tr"),
+        InlineKeyboardButton(text="🇬🇧 English", callback_data="language:en"),
+    ]])
+    await cb.message.answer("🌐 Dil seçimi / Language selection:", reply_markup=kb)
+    await cb.answer()
+
+@router.callback_query(F.data.startswith("language:"))
+async def set_language(cb: CallbackQuery):
+    await cb.message.answer("Dil ayarlandı.")
+    await cb.answer()
+
+@router.callback_query(F.data == "menu:help")
+async def menu_help(cb: CallbackQuery):
+    await cb.message.answer("ℹ️ Yardım menüsü.\nKomutlar için /help yazabilirsiniz.")
+    await cb.answer()
+
+@router.callback_query(F.data == "menu:broadcast")
+async def menu_broadcast(cb: CallbackQuery):
+    await cb.answer("Bu özellik sadece adminler içindir.", show_alert=True)
+
+@router.callback_query(F.data == "menu:admin")
+async def menu_admin(cb: CallbackQuery):
+    await cb.message.answer("🛠️ Admin komutları için /admin yazın.")
+    await cb.answer())
     target_id = int(data.get("transfer_target", 0))
     amount = int(data.get("transfer_amount", 0))
     sender_id = callback.from_user.id
