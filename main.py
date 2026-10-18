@@ -28,7 +28,7 @@ JOIN_CHANNEL_URL = os.getenv("JOIN_CHANNEL_URL", "").strip()
 LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "").strip()
 PROMO_CHANNEL_ID = os.getenv("PROMO_CHANNEL_ID", "").strip()
 STAR_TOPUP_TIERS_RAW = os.getenv("STAR_TOPUP_TIERS", "50:25,100:50,250:125,500:250").strip()
-VIP_PRICE_TL = os.getenv("VIP_PRICE_TL", "500").strip() # Railway'deki 500 TL ayarını çeker
+VIP_PRICE_TL = os.getenv("VIP_PRICE_TL", "500").strip()
 VIP_DURATION_DAYS = os.getenv("VIP_DURATION_DAYS", "30").strip()
 CANCEL_SECONDS = 6 * 60
 MAX_AMOUNT_CENTS = 100_000_000
@@ -347,8 +347,9 @@ async def build_welcome_text(user_id, first_name):
 @router.message(CommandStart())
 async def start_handler(message: Message):
     if not message.from_user: return
+    # Süre 10 saniye olarak ayarlandı
     loading_msg = await message.answer("🔄 Ana menü hazırlanıyor...")
-    asyncio.create_task(delete_after_delay(message.chat.id, loading_msg.message_id, 30, message.bot))
+    asyncio.create_task(delete_after_delay(message.chat.id, loading_msg.message_id, 10, message.bot))
     
     async with db_session() as db:
         cursor = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (message.from_user.id,))
@@ -764,12 +765,6 @@ async def receive_code(message: Message, state: FSMContext):
 # ==========================================
 # PROMO VE HAZİNE KULLANIM MANTIĞI
 # ==========================================
-@router.callback_query(F.data == "menu:rewards")
-async def menu_rewards(cb: CallbackQuery):
-    # Buraya istersen Promo Kodu Gir ve Hazine Katıl butonlarını ekleyebiliriz ama genelde kanaldan link ile gelinir.
-    text = "🎁 **Ödüller ve Görevler**\n\n- Bakiye Yükle kısmından yıldız ile bakiye yükleyebilirsiniz.\n- Kanaldaki Hazine ve Promo etkinliklerini takip edin!"
-    await cb.message.edit_text(text, reply_markup=back_to_menu_kb())
-
 @router.message(Command("promo"))
 async def promo_command(message: Message):
     parts = (message.text or "").split(maxsplit=1)
@@ -795,7 +790,6 @@ async def promo_command(message: Message):
         new_uses = promo['current_uses'] + 1
         await db.commit()
         
-        # Kanaldaki mesajı güncelle
         if promo['message_id'] and PROMO_CHANNEL_ID:
             rem_uses = promo['max_uses'] - new_uses
             rem_time = int((datetime.fromisoformat(promo['expires_at']) - now_utc()).total_seconds() / 60)
@@ -824,12 +818,10 @@ async def hazine_command(message: Message):
         cursor = await db.execute("SELECT 1 FROM hazine_claims WHERE hazine_id = ? AND user_id = ?", (hz['id'], message.from_user.id))
         if await cursor.fetchone(): return await message.answer("❌ Bu hazineden zaten payınızı aldınız.")
         
-        # Rastgele bakiye dağıtma algoritması (En fazla kalanın yarısı)
         max_claim = hz['remaining_cents'] // 2
         if max_claim < 1: max_claim = 1
         reward = random.randint(1, max_claim)
         
-        # Eğer son kişiyse kalanı ver
         if hz['current_users'] + 1 == hz['max_users']:
             reward = hz['remaining_cents']
             
@@ -841,7 +833,6 @@ async def hazine_command(message: Message):
         await db.execute("UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?", (reward, message.from_user.id))
         await add_transaction(db, message.from_user.id, reward, "hazine", f"Hazine Ödülü")
         
-        # Kanaldaki mesajı güncelle
         if hz['message_id'] and PROMO_CHANNEL_ID:
             rem_time = int((datetime.fromisoformat(hz['expires_at']) - now_utc()).total_seconds() / 60)
             rem_users = hz['max_users'] - new_users
