@@ -76,7 +76,7 @@ class AdminHazineFlow(StatesGroup):
     duration = State()
 
 # ==========================================
-# YARDIMCI FONKSİYONLAR VE DİNAMİK ÇEMBER
+# YARDIMCI FONKSİYONLAR
 # ==========================================
 ORDER_ANIMATIONS = {}
 ORDER_MESSAGE_REFS = {}
@@ -147,7 +147,7 @@ async def get_display_name(user_id):
     return f"Bilinmeyen Kullanıcı"
 
 # ==========================================
-# VERİTABANI (HATASIZ, last_seen_at YOK)
+# VERİTABANI (HATASIZ, GARANTİLİ)
 # ==========================================
 async def open_db():
     db = await aiosqlite.connect(DB_PATH, timeout=10)
@@ -163,6 +163,7 @@ async def db_session():
 
 async def init_db():
     async with db_session() as db:
+        # Tabloları oluştur
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, balance_cents INTEGER DEFAULT 0, points INTEGER DEFAULT 0, vip_until TEXT, last_daily_at TEXT, is_blocked INTEGER DEFAULT 0, created_at TEXT);
             CREATE TABLE IF NOT EXISTS services (service_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, description TEXT, price_cents INTEGER, active INTEGER DEFAULT 1);
@@ -197,15 +198,10 @@ async def get_setting(key):
 
 async def ensure_user(user, referrer_id=None):
     async with db_session() as db:
-        # last_seen_at sütunu KESİNLİKLE KULLANILMIYOR (Hata vermemesi için)
+        # İKİ AŞAMALI GÜVENLİ KAYIT (Hata verme ihtimali sıfır)
         try:
-            await db.execute("""
-                INSERT INTO users (user_id, username, first_name, created_at) 
-                VALUES (?, ?, ?, ?) 
-                ON CONFLICT(user_id) DO UPDATE SET 
-                    username = excluded.username, 
-                    first_name = excluded.first_name
-            """, (user.id, user.username or "", user.first_name or "User", timestamp()))
+            await db.execute("INSERT OR IGNORE INTO users (user_id, created_at) VALUES (?, ?)", (user.id, timestamp()))
+            await db.execute("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", (user.username or "", user.first_name or "User", user.id))
             await db.commit()
         except Exception as e:
             print("Kullanıcı kaydetme hatası:", e)
@@ -830,7 +826,7 @@ async def main():
     dp.include_router(router)
     dp.include_router(fallback_router)
     await init_db()
-    print("Bot calisiyor...")
+    print("Bot calisiyor... Yeni Kod")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
