@@ -161,19 +161,18 @@ async def db_session():
 async def init_db():
     async with db_session() as db:
         await db.executescript("""
-            CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, balance_cents INTEGER DEFAULT 0, points INTEGER DEFAULT 0, vip_until TEXT, last_daily_at TEXT, is_blocked INTEGER DEFAULT 0, joined_at TEXT);
+            CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, balance_cents INTEGER DEFAULT 0, points INTEGER DEFAULT 0, vip_until TEXT, last_daily_at TEXT, is_blocked INTEGER DEFAULT 0, created_at TEXT);
             CREATE TABLE IF NOT EXISTS services (service_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, description TEXT, price_cents INTEGER, active INTEGER DEFAULT 1);
             CREATE TABLE IF NOT EXISTS orders (order_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, service_id INTEGER, service_name TEXT, amount_cents INTEGER, status TEXT DEFAULT 'pending', created_at TEXT, expires_at TEXT);
             CREATE TABLE IF NOT EXISTS transactions (transaction_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount_cents INTEGER, kind TEXT, note TEXT, created_at TEXT);
             CREATE TABLE IF NOT EXISTS referrals (referral_id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, referred_user_id INTEGER UNIQUE, reward_cents INTEGER, rewarded_at TEXT, created_at TEXT);
             CREATE TABLE IF NOT EXISTS star_payment_intents (payload TEXT PRIMARY KEY, user_id INTEGER, stars_amount INTEGER, credit_cents INTEGER, status TEXT DEFAULT 'pending', created_at TEXT);
             CREATE TABLE IF NOT EXISTS support_tickets (ticket_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, body TEXT, status TEXT DEFAULT 'open', created_at TEXT);
-            CREATE TABLE IF NOT EXISTS promos (promo_id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, bonus_cents INTEGER, max_uses INTEGER, current_uses INTEGER DEFAULT 0, expires_at TEXT, active INTEGER DEFAULT 1);
-            CREATE TABLE IF NOT EXISTS promo_uses (promo_id INTEGER, user_id INTEGER, used_at TEXT, PRIMARY KEY(promo_id, user_id));
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS tasks (task_id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, reward_cents INTEGER, channel_id TEXT, active INTEGER DEFAULT 1);
             CREATE TABLE IF NOT EXISTS user_tasks (user_id INTEGER, task_id INTEGER, claimed_at TEXT, PRIMARY KEY(user_id, task_id));
             
+            -- Ayarlar: VIP açık, Kupon açık, Görev açık, Referans ilk sipariş şartlı
             INSERT OR IGNORE INTO settings (key, value) VALUES 
             ('vip_enabled', '1'), ('coupon_enabled', '1'), ('rewards_enabled', '1'), 
             ('vip_price_tl', '50'), ('vip_duration_days', '30'), ('ref_require_order', '1');
@@ -194,8 +193,8 @@ async def get_setting(key):
 
 async def ensure_user(user):
     async with db_session() as db:
-        await db.execute("INSERT INTO users (user_id, username, first_name, created_at, last_seen_at, joined_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET last_seen_at = excluded.last_seen_at, username = excluded.username, is_blocked = 0",
-                         (user.id, user.username or "", user.first_name or "User", timestamp(), timestamp(), timestamp()))
+        await db.execute("INSERT INTO users (user_id, username, first_name, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET last_seen_at = excluded.last_seen_at, username = excluded.username, is_blocked = 0",
+                         (user.id, user.username or "", user.first_name or "User", timestamp(), timestamp()))
         await db.commit()
 
 async def add_transaction(db, user_id, amount, kind, note):
@@ -216,7 +215,7 @@ async def handle_referral_penalty(bot, user_id, reason):
             await db.execute("DELETE FROM referrals WHERE referral_id = ?", (ref['referral_id'],))
             await db.commit()
             uname = await get_display_name(user_id)
-            msg = f"⚠️ **Referans İptal Bildirimi**\n\nDavet ettiğiniz **{uname}** isimli kullanıcı {reason}.\nKazandığınız `{format_money(reward)}` ödül kurallar gereği geri alınmıştır."
+            msg = f"⚠️ **Referans İptal Bildirimi**\n\nDavet ettiğiniz **{uname}** isimli kullanıcı {reason}.\nKazandığınız `{format_money(reward)}` ödül kurallar gereği bakiyenizden düşürülmüştür."
             try: await bot.send_message(referrer_id, msg, parse_mode="Markdown")
             except: pass
 
@@ -353,6 +352,26 @@ async def back_to_menu(cb: CallbackQuery):
     await cb.message.edit_text(text, reply_markup=main_keyboard(cb.from_user.id), parse_mode="Markdown")
     await cb.answer()
 
+@router.callback_query(F.data == "menu:balance")
+async def menu_balance(cb: CallbackQuery):
+    async with db_session() as db:
+        cursor = await db.execute("SELECT balance_cents, points, vip_until FROM users WHERE user_id = ?", (cb.from_user.id,))
+        row = await cursor.fetchone()
+        
+    vip_status = "Aktif Değil ❌"
+    if row and row['vip_until']:
+        try:
+            if datetime.fromisoformat(row['vip_until']) > now_utc(): vip_status = f"Aktif ✅ ({row['vip_until'][:10]}'e kadar)"
+        except: pass
+
+    text = (f"💰 **Cüzdan Detayları**\n\n"
+            f"🔹 Bakiye: `{format_money(row['balance_cents'] if row else 0)}`\n"
+            f"🔹 Puan: `{row['points'] if row else 0}`\n"
+            f"🔹 VIP Üyelik: `{vip_status}`\n\n"
+            f"💡 *Bakiye yüklemek için '⭐ Bakiye Yükle' butonunu kullanabilirsiniz.*")
+    await cb.message.edit_text(text, reply_markup=back_to_menu_kb(), parse_mode="Markdown")
+    await cb.answer()
+
 # ==========================================
 # GÜNLÜK ÖDÜL VE GÖREVLER MENÜSÜ
 # ==========================================
@@ -370,7 +389,6 @@ async def menu_rewards(cb: CallbackQuery):
     text = "🎁 **Ödüller ve Görevler**\n\nAşağıdaki görevleri tamamlayarak ekstra bakiye kazanabilirsiniz:\n\n"
     kb = []
     
-    # Günlük Bonus Butonu
     kb.append([InlineKeyboardButton(text="🎁 Günlük Ödülünü Al (+1 TL)", callback_data="daily_bonus", style="success")])
     
     for t in tasks:
@@ -393,7 +411,6 @@ async def claim_daily_bonus(cb: CallbackQuery):
         now = now_utc()
         if user['last_daily_at']:
             last_claim = datetime.fromisoformat(user['last_daily_at'])
-            # 86400 saniye = 24 saat
             elapsed = (now - last_claim).total_seconds()
             if elapsed < 86400:
                 remaining = 86400 - elapsed
@@ -401,7 +418,6 @@ async def claim_daily_bonus(cb: CallbackQuery):
                 mins = int((remaining % 3600) // 60)
                 return await cb.answer(f"⏳ Günlük ödülünüzü zaten aldınız!\n\nKalan süre: {hours} saat {mins} dakika.", show_alert=True)
 
-        # Ödül ver (1 TL)
         reward_cents = 100
         new_balance = user['balance_cents'] + reward_cents
         await db.execute("UPDATE users SET balance_cents = ?, last_daily_at = ? WHERE user_id = ?", (new_balance, timestamp(), user_id))
@@ -505,7 +521,6 @@ async def buy_service(cb: CallbackQuery):
         cursor = await db.execute("INSERT INTO orders (user_id, service_id, service_name, amount_cents, status, created_at, expires_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)", (cb.from_user.id, sid, s['name'], final_price, timestamp(), (now_utc()+timedelta(seconds=CANCEL_SECONDS)).isoformat()))
         oid = cursor.lastrowid; await add_transaction(db, cb.from_user.id, -final_price, "order", f"Sipariş #{oid}"); await db.commit()
     
-    # BAŞARILAR MESAJI (Sipariş Verilince)
     await cb.message.answer(f"🎉 **Başarılar!**\n\n✅ Siparişiniz başarıyla oluşturuldu ve yönetici onayına düştü.\n⏳ Lütfen numaranızın size iletilmesini bekleyin.", parse_mode="Markdown")
     
     try:
@@ -590,12 +605,147 @@ async def receive_code(message: Message, state: FSMContext):
         await db.commit()
         cursor = await db.execute("SELECT user_id FROM orders WHERE order_id = ?", (oid,)); uid = (await cursor.fetchone())['user_id']
 
-    # BAŞARILAR MESAJI (Numara Verilince)
     await message.bot.send_message(uid, f"🎉 **Tebrikler, Başarılar!**\n\n✅ Siparişiniz tamamlandı ve numaranız hazır.\n\n📱 Numara: `{phone}`\n🔑 Kod: `{code}`", parse_mode="Markdown")
     await message.answer("Sipariş başarıyla kapatıldı.")
 
 # ==========================================
-# DİĞER YARDIMCI FONKSİYONLAR (İptal, Admin vs.)
+# ADMİN: BAKİYE EKLE / SİL
+# ==========================================
+@router.callback_query(F.data.in_({"admin:bal_add", "admin:bal_rem"}))
+async def admin_bal_start(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id): return
+    action = "eklemek" if "add" in cb.data else "silmek"
+    await state.set_state(AdminBalanceFlow.user_query)
+    await state.update_data(action=cb.data)
+    await cb.message.edit_text(f"💰 **Bakiye {action.capitalize()}**\n\nLütfen kullanıcının `@kullanıcıadı` veya `Telegram ID`'sini yazın:", parse_mode="Markdown")
+
+@router.message(AdminBalanceFlow.user_query)
+async def admin_bal_user(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    query = message.text.strip()
+    async with db_session() as db:
+        if query.startswith("@"):
+            cursor = await db.execute("SELECT user_id, first_name FROM users WHERE lower(username) = lower(?)", (query[1:],))
+        else:
+            cursor = await db.execute("SELECT user_id, first_name FROM users WHERE user_id = ?", (query,))
+        user = await cursor.fetchone()
+    if not user: return await message.answer("❌ **Böyle bir kullanıcı yok!**\nLütfen geçerli bir kullanıcı adı veya ID girin.")
+    
+    await state.update_data(target_id=user['user_id'], target_name=user['first_name'])
+    await state.set_state(AdminBalanceFlow.amount)
+    await message.answer(f"✅ Kullanıcı bulundu: **{user['first_name']}**\n\nLütfen işlem yapılacak TL tutarını yazın (Örn: `50`):", parse_mode="Markdown")
+
+@router.message(AdminBalanceFlow.amount)
+async def admin_bal_amount(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    try: amount = parse_money(message.text)
+    except: return await message.answer("❌ Geçersiz tutar. Lütfen sayı girin.")
+    
+    data = await state.get_data(); await state.clear()
+    is_add = "add" in data['action']
+    async with db_session() as db:
+        if is_add: await db.execute("UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?", (amount, data['target_id']))
+        else: await db.execute("UPDATE users SET balance_cents = balance_cents - ? WHERE user_id = ?", (amount, data['target_id']))
+        await add_transaction(db, data['target_id'], amount if is_add else -amount, "admin", f"Admin bakiye {'ekledi' if is_add else 'sildi'}")
+        await db.commit()
+    await message.answer(f"✅ **{data['target_name']}** adlı kullanıcının bakiyesi {format_money(amount)} {'artırıldı' if is_add else 'azaltıldı'}.", reply_markup=back_to_menu_kb())
+
+# ==========================================
+# ADMİN PANELİ, AYARLAR VE DİĞER İŞLEMLER
+# ==========================================
+@router.callback_query(F.data == "menu:admin")
+async def menu_admin(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id): return await cb.answer("Yetkiniz yok.", show_alert=True)
+    await cb.message.edit_text("🛠️ **Admin Paneli**\n\nİşlem yapmak istediğiniz seçeneği belirleyin:", reply_markup=admin_panel_kb(), parse_mode="Markdown")
+
+@router.callback_query(F.data == "admin:settings")
+async def admin_settings(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id): return
+    await cb.message.edit_text("⚙️ **Özellik Ayarları**\n\nAçıp kapatmak istediğiniz özelliği seçin:", reply_markup=settings_kb(), parse_mode="Markdown")
+
+@router.callback_query(F.data.startswith("toggle:"))
+async def toggle_setting(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id): return
+    key = cb.data.split(":")[1]
+    async with db_session() as db:
+        cursor = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        new_val = '0' if row['value'] == '1' else '1'
+        await db.execute("UPDATE settings SET value = ? WHERE key = ?", (new_val, key))
+        await db.commit()
+    await cb.answer(f"Özellik {'Açıldı' if new_val == '1' else 'Kapatıldı'}!", show_alert=True)
+
+# ==========================================
+# DİĞER KULLANICI MENÜLERİ (VIP, KUPON, DESTEK)
+# ==========================================
+@router.callback_query(F.data == "menu:vip")
+async def menu_vip(cb: CallbackQuery):
+    if not await is_feature_enabled('vip_enabled'): return await cb.message.edit_text("🚧 **VIP üyelik geçici olarak kapalıdır.**", reply_markup=back_to_menu_kb(), parse_mode="Markdown")
+    price = await get_setting('vip_price_tl'); days = await get_setting('vip_duration_days')
+    text = f"💎 **VIP Üyelik**\n\nVIP üyelerimiz tüm siparişlerde **%20 indirim** kazanır ve siparişleri **öncelikli** işleme alınır.\n\n💰 **Fiyat:** `{price} TL`\n⏳ **Süre:** `{days} Gün`"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💳 Satın Al", callback_data="vip_buy", style="success")], [InlineKeyboardButton(text="🔙 Geri", callback_data="menu:back", style="primary")]])
+    await cb.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+
+@router.callback_query(F.data == "vip_buy")
+async def vip_buy(cb: CallbackQuery):
+    price_cents = int(float(await get_setting('vip_price_tl')) * 100); days = int(await get_setting('vip_duration_days'))
+    async with db_session() as db:
+        cursor = await db.execute("SELECT balance_cents FROM users WHERE user_id = ?", (cb.from_user.id,)); user = await cursor.fetchone()
+        if user['balance_cents'] < price_cents: return await cb.answer("❌ Yetersiz bakiye.", show_alert=True)
+        new_vip = (now_utc() + timedelta(days=days)).isoformat()
+        await db.execute("UPDATE users SET balance_cents = balance_cents - ?, vip_until = ? WHERE user_id = ?", (price_cents, new_vip, cb.from_user.id))
+        await add_transaction(db, cb.from_user.id, -price_cents, "vip", "VIP Satın Alma"); await db.commit()
+    await cb.message.edit_text(f"✅ Tebrikler! VIP üyeliğiniz başladı. Bitiş: {new_vip[:10]}", reply_markup=back_to_menu_kb())
+
+@router.callback_query(F.data == "menu:coupon")
+async def menu_coupon(cb: CallbackQuery):
+    if not await is_feature_enabled('coupon_enabled'): return await cb.message.edit_text("🚧 **Kupon sistemi geçici olarak kapalıdır.**", reply_markup=back_to_menu_kb(), parse_mode="Markdown")
+    await cb.message.edit_text("🎟️ **İndirim Kuponu**\n\nKupon kodunuzu girin:", reply_markup=back_to_menu_kb())
+
+@router.callback_query(F.data == "menu:support")
+async def menu_support(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(SupportFlow.body); await cb.message.edit_text("💬 **Destek Talebi**\n\nSorununuzu tek mesaj halinde yazın:", parse_mode="Markdown")
+
+@router.message(SupportFlow.body)
+async def support_body(message: Message, state: FSMContext):
+    await state.clear()
+    async with db_session() as db:
+        cursor = await db.execute("INSERT INTO support_tickets (user_id, body, created_at) VALUES (?, ?, ?)", (message.from_user.id, message.text, timestamp())); tid = cursor.lastrowid; await db.commit()
+    await message.answer("✅ Talebiniz alındı.", reply_markup=back_to_menu_kb())
+    uname = await get_display_name(message.from_user.id)
+    await notify_admins(message.bot, f"🚨 **Destek #{tid}**\n👤 Kullanıcı: {uname}\n💬 {message.text}")
+
+# ==========================================
+# REFERANS SİSTEMİ (AÇ / KAPAT)
+# ==========================================
+@router.callback_query(F.data == "menu:referral")
+async def menu_referral(cb: CallbackQuery):
+    me = await cb.bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{cb.from_user.id}"
+    
+    require_order = await get_setting('ref_require_order')
+    if require_order == '1':
+        rule_text = "ℹ️ *Kural:* Davet ettiğiniz kişi ilk numarasını aldığında ödülünüz hesabınıza yatacaktır."
+    else:
+        rule_text = "ℹ️ *Kural:* Davet ettiğiniz kişi bota katıldığı an ödülünüz hesabınıza yatacaktır."
+
+    async with db_session() as db:
+        cursor = await db.execute("SELECT COUNT(*) as total, SUM(CASE WHEN rewarded_at IS NOT NULL THEN reward_cents ELSE 0 END) as earned FROM referrals WHERE referrer_id = ?", (cb.from_user.id,))
+        row = await cursor.fetchone()
+        
+    total = row['total'] or 0
+    earned = row['earned'] or 0
+    text = (f"👥 **Referans Sistemi**\n\n"
+            f"🔗 **Davet Linkiniz:**\n`{link}`\n\n"
+            f"📊 **İstatistikleriniz:**\n"
+            f"• Davet Edilen: `{total}` kişi\n"
+            f"• Kazanılan Ödül: `{format_money(earned)}`\n\n"
+            f"{rule_text}")
+    await cb.message.edit_text(text, reply_markup=back_to_menu_kb(), parse_mode="Markdown")
+    await cb.answer()
+
+# ==========================================
+# SİPARİŞ İPTAL (KULLANICI VEYA ADMİN)
 # ==========================================
 @router.callback_query(F.data.startswith("o:"))
 async def cancel_order(cb: CallbackQuery):
