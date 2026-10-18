@@ -147,7 +147,7 @@ async def get_display_name(user_id):
     return f"Bilinmeyen Kullanıcı"
 
 # ==========================================
-# VERİTABANI (HATASIZ VE GÜVENLİ)
+# VERİTABANI (ZORUNLU GÜNCELLEYİCİ)
 # ==========================================
 async def open_db():
     db = await aiosqlite.connect(DB_PATH, timeout=10)
@@ -163,6 +163,7 @@ async def db_session():
 
 async def init_db():
     async with db_session() as db:
+        # 1. Tabloları oluştur
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, balance_cents INTEGER DEFAULT 0, points INTEGER DEFAULT 0, vip_until TEXT, last_daily_at TEXT, is_blocked INTEGER DEFAULT 0, created_at TEXT);
             CREATE TABLE IF NOT EXISTS services (service_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, description TEXT, price_cents INTEGER, active INTEGER DEFAULT 1);
@@ -182,6 +183,24 @@ async def init_db():
         """)
         await db.commit()
 
+        # 2. Eski veritabanlarında eksik olan sütunları ZORLA ekle
+        try:
+            cursor = await db.execute("PRAGMA table_info(users)")
+            columns = [row["name"] for row in await cursor.fetchall()]
+            if "last_seen_at" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN last_seen_at TEXT")
+            if "is_blocked" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0")
+            if "vip_until" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN vip_until TEXT")
+            if "last_daily_at" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN last_daily_at TEXT")
+            if "points" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN points INTEGER DEFAULT 0")
+            await db.commit()
+        except Exception as e:
+            print("Veritabanı sütun güncelleme hatası:", e)
+
 async def is_feature_enabled(feature):
     async with db_session() as db:
         cursor = await db.execute("SELECT value FROM settings WHERE key = ?", (feature,))
@@ -196,7 +215,7 @@ async def get_setting(key):
 
 async def ensure_user(user):
     async with db_session() as db:
-        # Hata vermemesi için last_seen_at sütununu sorgudan çıkardık
+        # last_seen_at kullanılmıyor, bu yüzden hata vermez
         await db.execute("""
             INSERT INTO users (user_id, username, first_name, created_at, is_blocked) 
             VALUES (?, ?, ?, ?, 0) 
@@ -321,7 +340,7 @@ async def start_handler(message: Message):
     uid = message.from_user.id
     
     # Eski klavyeyi sil
-    try: await message.answer("🔄 Yükleniyor...", reply_markup=ReplyKeyboardRemove())
+    try: await message.answer("Yükleniyor...", reply_markup=ReplyKeyboardRemove())
     except: pass
 
     async with db_session() as db:
