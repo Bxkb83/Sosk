@@ -37,9 +37,6 @@ router = Router()
 fallback_router = Router(name="store-fallback")
 logger = logging.getLogger("service-order-bot")
 
-# Bekleyen silme işlemleri için global takip listesi
-PENDING_DELETIONS = {}
-
 def channel_join_url():
     return JOIN_CHANNEL_URL or (f"https://t.me/{FORCE_JOIN_CHANNEL[1:]}" if FORCE_JOIN_CHANNEL.startswith("@") else "")
 
@@ -79,7 +76,7 @@ class AdminHazineFlow(StatesGroup):
     duration = State()
 
 # ==========================================
-# YARDIMCI FONKSİYONLAR VE DİNAMİK ÇEMBER
+# YARDIMCI FONKSİYONLAR
 # ==========================================
 ORDER_ANIMATIONS = {}
 ORDER_MESSAGE_REFS = {}
@@ -150,7 +147,7 @@ async def get_display_name(user_id):
     return f"Bilinmeyen Kullanıcı"
 
 # ==========================================
-# VERİTABANI
+# VERİTABANI VE OTOMATİK GÜNCELLEYİCİ
 # ==========================================
 async def open_db():
     db = await aiosqlite.connect(DB_PATH, timeout=10)
@@ -177,35 +174,31 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS tasks (task_id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, reward_cents INTEGER, channel_id TEXT, active INTEGER DEFAULT 1);
             CREATE TABLE IF NOT EXISTS user_tasks (user_id INTEGER, task_id INTEGER, claimed_at TEXT, PRIMARY KEY(user_id, task_id));
-            
-            CREATE TABLE IF NOT EXISTS promos (
-                code TEXT PRIMARY KEY, 
-                bonus_cents INTEGER, 
-                max_uses INTEGER, 
-                current_uses INTEGER DEFAULT 0, 
-                expires_at TEXT, 
-                active INTEGER DEFAULT 1,
-                message_id INTEGER
-            );
+            CREATE TABLE IF NOT EXISTS promos (code TEXT PRIMARY KEY, bonus_cents INTEGER, max_uses INTEGER, current_uses INTEGER DEFAULT 0, expires_at TEXT, active INTEGER DEFAULT 1, message_id INTEGER);
             CREATE TABLE IF NOT EXISTS promo_uses (code TEXT, user_id INTEGER, PRIMARY KEY(code, user_id));
-            
-            CREATE TABLE IF NOT EXISTS hazine (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                total_cents INTEGER,
-                remaining_cents INTEGER,
-                max_users INTEGER,
-                current_users INTEGER DEFAULT 0,
-                expires_at TEXT,
-                active INTEGER DEFAULT 1,
-                message_id INTEGER
-            );
+            CREATE TABLE IF NOT EXISTS hazine (id INTEGER PRIMARY KEY AUTOINCREMENT, total_cents INTEGER, remaining_cents INTEGER, max_users INTEGER, current_users INTEGER DEFAULT 0, expires_at TEXT, active INTEGER DEFAULT 1, message_id INTEGER);
             CREATE TABLE IF NOT EXISTS hazine_claims (hazine_id INTEGER, user_id INTEGER, amount_cents INTEGER, PRIMARY KEY(hazine_id, user_id));
-
-            INSERT OR IGNORE INTO settings (key, value) VALUES 
-            ('vip_enabled', '1'), ('coupon_enabled', '1'), ('rewards_enabled', '1'), 
-            ('vip_price_tl', '500'), ('vip_duration_days', '30'), ('ref_require_order', '1');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('vip_enabled', '1'), ('coupon_enabled', '1'), ('rewards_enabled', '1'), ('vip_price_tl', '500'), ('vip_duration_days', '30'), ('ref_require_order', '1');
         """)
         await db.commit()
+        
+        # OTOMATİK GÜNCELLEYİCİ (Eski veritabanları için sütun ekler)
+        try:
+            cursor = await db.execute("PRAGMA table_info(users)")
+            columns = [row["name"] for row in await cursor.fetchall()]
+            if "last_seen_at" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN last_seen_at TEXT")
+            if "is_blocked" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0")
+            if "vip_until" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN vip_until TEXT")
+            if "last_daily_at" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN last_daily_at TEXT")
+            if "points" not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN points INTEGER DEFAULT 0")
+            await db.commit()
+        except Exception as e:
+            print("Sütun güncelleme hatası:", e)
 
 async def is_feature_enabled(feature):
     async with db_session() as db:
@@ -221,8 +214,12 @@ async def get_setting(key):
 
 async def ensure_user(user):
     async with db_session() as db:
-        await db.execute("INSERT INTO users (user_id, username, first_name, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET last_seen_at = excluded.last_seen_at, username = excluded.username, is_blocked = 0",
-                         (user.id, user.username or "", user.first_name or "User", timestamp(), timestamp()))
+        try:
+            await db.execute("INSERT INTO users (user_id, username, first_name, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET last_seen_at = excluded.last_seen_at, username = excluded.username, is_blocked = 0",
+                             (user.id, user.username or "", user.first_name or "User", timestamp(), timestamp()))
+        except Exception:
+            await db.execute("INSERT INTO users (user_id, username, first_name, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET username = excluded.username",
+                             (user.id, user.username or "", user.first_name or "User", timestamp()))
         await db.commit()
 
 async def add_transaction(db, user_id, amount, kind, note):
@@ -317,71 +314,7 @@ def settings_kb():
     ])
 
 # ==========================================
-# START VE ANA MENÜ (BEKLETME SİSTEMİ)
-# ==========================================
-async def delete_loading_message(bot, chat_id, message_id, delay=10):
-    await asyncio.sleep(delay)
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except TelegramAPIError:
-        pass
-
-@router.message(CommandStart())
-async def start_handler(message: Message):
-    if not message.from_user: return
-    
-    # 1. Eski bekleyen mesajları temizle (Kullanıcı /start spamlarsa)
-    uid = message.from_user.id
-    if uid in PENDING_DELETIONS:
-        for old_msg_id in PENDING_DELETIONS[uid]:
-            try: await message.bot.delete_message(chat_id=message.chat.id, message_id=old_msg_id)
-            except: pass
-    PENDING_DELETIONS[uid] = []
-
-    # 2. Yeni bekleme mesajını at ve kaydet
-    loading_msg = await message.answer("🔄 Ana menü hazırlanıyor...")
-    PENDING_DELETIONS[uid].append(loading_msg.message_id)
-    
-    # 3. Arka planda tam 10 saniye sonra sil
-    asyncio.create_task(delete_loading_message(message.bot, message.chat.id, loading_msg.message_id, 10))
-    
-    # 4. Veritabanı işlemleri
-    async with db_session() as db:
-        cursor = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (uid,))
-        is_new = await cursor.fetchone() is None
-    
-    if is_new:
-        await ensure_user(message.from_user)
-        args = message.text.split()
-        if len(args) > 1 and args[1].startswith("ref_"):
-            referrer_id = int(args[1][4:])
-            if referrer_id != uid:
-                async with db_session() as db:
-                    await db.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_user_id, reward_cents, created_at) VALUES (?, ?, ?, ?)", (referrer_id, uid, REFERRAL_BONUS_CENTS, timestamp()))
-                    await db.commit()
-                
-                require_order = await get_setting('ref_require_order')
-                if require_order == '0':
-                    async with db_session() as db:
-                        await db.execute("UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?", (REFERRAL_BONUS_CENTS, referrer_id))
-                        await db.execute("UPDATE referrals SET rewarded_at = ? WHERE referred_user_id = ?", (timestamp(), uid))
-                        await add_transaction(db, referrer_id, REFERRAL_BONUS_CENTS, "referral", "Davet ödülü (Anında)")
-                        await db.commit()
-                    try: await message.bot.send_message(referrer_id, f"🎉 Tebrikler! Davet ettiğiniz kişi bota katıldı ve `{format_money(REFERRAL_BONUS_CENTS)}` kazandınız.", parse_mode="Markdown")
-                    except: pass
-
-    # 5. Menüyü gönder
-    text = await build_welcome_text(uid, message.from_user.first_name)
-    await message.answer(text, reply_markup=main_keyboard(uid), parse_mode="Markdown")
-
-@router.callback_query(F.data == "menu:back")
-async def back_to_menu(cb: CallbackQuery):
-    text = await build_welcome_text(cb.from_user.id, cb.from_user.first_name)
-    await cb.message.edit_text(text, reply_markup=main_keyboard(cb.from_user.id), parse_mode="Markdown")
-    await cb.answer()
-
-# ==========================================
-# STANDART MENÜ VE İŞLEMLER (Diğer kodlar aynı)
+# START VE ANA MENÜ (BEKLEMESİZ)
 # ==========================================
 async def build_welcome_text(user_id, first_name):
     async with db_session() as db:
@@ -396,7 +329,47 @@ async def build_welcome_text(user_id, first_name):
         except: pass
     return (f"🌟 **Hoş Geldin, {first_name}!**\n\n💳 **Cüzdan Bilgileriniz:**\n├ 💰 Bakiye: `{format_money(user['balance_cents'] if user else 0)}`\n├ 🎯 Puan: `{user['points'] if user else 0}`\n├ 📦 Sipariş: `{order_count}`\n└ 💎 VIP: `{vip_status}`\n\n🚀 *Sistemimiz 7/24 otomatik teslimat ile kesintisiz hizmet vermektedir.*\n⚡ *VIP üyelerimiz öncelikli işlem ve %20 indirim avantajına sahiptir.*\n\n👇 İşlem yapmak için aşağıdaki menüyü kullanın:")
 
-# (Buradan sonrası bir önceki tam kodla tamamen aynıdır, kodun tamamını istediğin için buraya eklemedim, bir önceki mesajdaki kodu kullanabilirsin, sadece start_handler kısmını yukarıdakiyle değiştir.)
+@router.message(CommandStart())
+async def start_handler(message: Message):
+    if not message.from_user: return
+    uid = message.from_user.id
+    
+    # Eski klavyeyi sil (varsa)
+    try: await message.answer("Yükleniyor...", reply_markup=ReplyKeyboardRemove())
+    except: pass
+
+    async with db_session() as db:
+        cursor = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (uid,))
+        is_new = await cursor.fetchone() is None
+    
+    if is_new:
+        await ensure_user(message.from_user)
+        args = message.text.split()
+        if len(args) > 1 and args[1].startswith("ref_"):
+            referrer_id = int(args[1][4:])
+            if referrer_id != uid:
+                async with db_session() as db:
+                    await db.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_user_id, reward_cents, created_at) VALUES (?, ?, ?, ?)", (referrer_id, uid, REFERRAL_BONUS_CENTS, timestamp()))
+                    await db.commit()
+                require_order = await get_setting('ref_require_order')
+                if require_order == '0':
+                    async with db_session() as db:
+                        await db.execute("UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?", (REFERRAL_BONUS_CENTS, referrer_id))
+                        await db.execute("UPDATE referrals SET rewarded_at = ? WHERE referred_user_id = ?", (timestamp(), uid))
+                        await add_transaction(db, referrer_id, REFERRAL_BONUS_CENTS, "referral", "Davet ödülü (Anında)")
+                        await db.commit()
+                    try: await message.bot.send_message(referrer_id, f"🎉 Tebrikler! Davet ettiğiniz kişi bota katıldı ve `{format_money(REFERRAL_BONUS_CENTS)}` kazandınız.", parse_mode="Markdown")
+                    except: pass
+
+    # Direkt menüyü gönder (bekleme mesajı yok)
+    text = await build_welcome_text(uid, message.from_user.first_name)
+    await message.answer(text, reply_markup=main_keyboard(uid), parse_mode="Markdown")
+
+@router.callback_query(F.data == "menu:back")
+async def back_to_menu(cb: CallbackQuery):
+    text = await build_welcome_text(cb.from_user.id, cb.from_user.first_name)
+    await cb.message.edit_text(text, reply_markup=main_keyboard(cb.from_user.id), parse_mode="Markdown")
+    await cb.answer()
 
 @router.callback_query(F.data == "menu:balance")
 async def menu_balance(cb: CallbackQuery):
