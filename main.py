@@ -147,7 +147,7 @@ async def get_display_name(user_id):
     return f"Bilinmeyen Kullanıcı"
 
 # ==========================================
-# VERİTABANI VE OTOMATİK GÜNCELLEYİCİ
+# VERİTABANI (HATASIZ VE GÜVENLİ)
 # ==========================================
 async def open_db():
     db = await aiosqlite.connect(DB_PATH, timeout=10)
@@ -164,7 +164,7 @@ async def db_session():
 async def init_db():
     async with db_session() as db:
         await db.executescript("""
-            CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, balance_cents INTEGER DEFAULT 0, points INTEGER DEFAULT 0, vip_until TEXT, last_daily_at TEXT, last_seen_at TEXT, is_blocked INTEGER DEFAULT 0, created_at TEXT);
+            CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, balance_cents INTEGER DEFAULT 0, points INTEGER DEFAULT 0, vip_until TEXT, last_daily_at TEXT, is_blocked INTEGER DEFAULT 0, created_at TEXT);
             CREATE TABLE IF NOT EXISTS services (service_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, description TEXT, price_cents INTEGER, active INTEGER DEFAULT 1);
             CREATE TABLE IF NOT EXISTS orders (order_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, service_id INTEGER, service_name TEXT, amount_cents INTEGER, status TEXT DEFAULT 'pending', created_at TEXT, expires_at TEXT);
             CREATE TABLE IF NOT EXISTS transactions (transaction_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount_cents INTEGER, kind TEXT, note TEXT, created_at TEXT);
@@ -181,24 +181,6 @@ async def init_db():
             INSERT OR IGNORE INTO settings (key, value) VALUES ('vip_enabled', '1'), ('coupon_enabled', '1'), ('rewards_enabled', '1'), ('vip_price_tl', '500'), ('vip_duration_days', '30'), ('ref_require_order', '1');
         """)
         await db.commit()
-        
-        # OTOMATİK GÜNCELLEYİCİ (Eski veritabanları için sütun ekler)
-        try:
-            cursor = await db.execute("PRAGMA table_info(users)")
-            columns = [row["name"] for row in await cursor.fetchall()]
-            if "last_seen_at" not in columns:
-                await db.execute("ALTER TABLE users ADD COLUMN last_seen_at TEXT")
-            if "is_blocked" not in columns:
-                await db.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0")
-            if "vip_until" not in columns:
-                await db.execute("ALTER TABLE users ADD COLUMN vip_until TEXT")
-            if "last_daily_at" not in columns:
-                await db.execute("ALTER TABLE users ADD COLUMN last_daily_at TEXT")
-            if "points" not in columns:
-                await db.execute("ALTER TABLE users ADD COLUMN points INTEGER DEFAULT 0")
-            await db.commit()
-        except Exception as e:
-            print("Sütun güncelleme hatası:", e)
 
 async def is_feature_enabled(feature):
     async with db_session() as db:
@@ -214,12 +196,14 @@ async def get_setting(key):
 
 async def ensure_user(user):
     async with db_session() as db:
-        try:
-            await db.execute("INSERT INTO users (user_id, username, first_name, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET last_seen_at = excluded.last_seen_at, username = excluded.username, is_blocked = 0",
-                             (user.id, user.username or "", user.first_name or "User", timestamp(), timestamp()))
-        except Exception:
-            await db.execute("INSERT INTO users (user_id, username, first_name, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET username = excluded.username",
-                             (user.id, user.username or "", user.first_name or "User", timestamp()))
+        # Hata vermemesi için last_seen_at sütununu sorgudan çıkardık
+        await db.execute("""
+            INSERT INTO users (user_id, username, first_name, created_at, is_blocked) 
+            VALUES (?, ?, ?, ?, 0) 
+            ON CONFLICT(user_id) DO UPDATE SET 
+                username = excluded.username, 
+                is_blocked = 0
+        """, (user.id, user.username or "", user.first_name or "User", timestamp()))
         await db.commit()
 
 async def add_transaction(db, user_id, amount, kind, note):
@@ -252,7 +236,9 @@ class JoinChannelMiddleware(BaseMiddleware):
         user = getattr(event, "from_user", None)
         if user is None or is_admin(user.id): return await handler(event, data)
         
-        if isinstance(event, Message) and event.text and event.text.startswith("/start"): await ensure_user(user)
+        if isinstance(event, Message) and event.text and event.text.startswith("/start"): 
+            await ensure_user(user)
+            
         if not FORCE_JOIN_CHANNEL: return await handler(event, data)
         
         try:
@@ -334,8 +320,8 @@ async def start_handler(message: Message):
     if not message.from_user: return
     uid = message.from_user.id
     
-    # Eski klavyeyi sil (varsa)
-    try: await message.answer("Yükleniyor...", reply_markup=ReplyKeyboardRemove())
+    # Eski klavyeyi sil
+    try: await message.answer("🔄 Yükleniyor...", reply_markup=ReplyKeyboardRemove())
     except: pass
 
     async with db_session() as db:
@@ -361,7 +347,7 @@ async def start_handler(message: Message):
                     try: await message.bot.send_message(referrer_id, f"🎉 Tebrikler! Davet ettiğiniz kişi bota katıldı ve `{format_money(REFERRAL_BONUS_CENTS)}` kazandınız.", parse_mode="Markdown")
                     except: pass
 
-    # Direkt menüyü gönder (bekleme mesajı yok)
+    # Direkt menüyü gönder
     text = await build_welcome_text(uid, message.from_user.first_name)
     await message.answer(text, reply_markup=main_keyboard(uid), parse_mode="Markdown")
 
