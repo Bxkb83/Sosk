@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -183,7 +183,6 @@ async def init_db():
         """)
         await db.commit()
 
-        # Eski veritabanları için sütun kontrolü (services tablosuna country_code ekle)
         try:
             cursor = await db.execute("PRAGMA table_info(services)")
             columns = [row["name"] for row in await cursor.fetchall()]
@@ -282,9 +281,9 @@ def main_keyboard(user_id):
     rows = [
         [InlineKeyboardButton(text="🛍️ Market", callback_data="menu:catalog", style="primary"), InlineKeyboardButton(text="💰 Bakiyem", callback_data="menu:balance", style="success")],
         [InlineKeyboardButton(text="📦 Siparişlerim", callback_data="menu:orders", style="primary"), InlineKeyboardButton(text="⭐ Yıldız ile Yükle", callback_data="menu:topup", style="success")],
-        [InlineKeyboardButton(text="💎 VIP Üyelik", callback_data="menu:vip", style="success"), InlineKeyboardButton(text="🎟️ Kupon", callback_data="menu:coupon", style="primary")],
-        [InlineKeyboardButton(text="👥 Arkadaşını Davet Et", callback_data="menu:referral", style="primary"), InlineKeyboardButton(text="🏆 Liderlik", callback_data="menu:leaderboard", style="success")],
-        [InlineKeyboardButton(text="💬 Destek", callback_data="menu:support", style="success"), InlineKeyboardButton(text="ℹ️ Yardım", callback_data="menu:help", style="primary")]
+        [InlineKeyboardButton(text="💎 VIP Üyelik", callback_data="menu:vip", style="success"), InlineKeyboardButton(text="👥 Arkadaşını Davet Et", callback_data="menu:referral", style="primary")],
+        [InlineKeyboardButton(text="🏆 Liderlik", callback_data="menu:leaderboard", style="success"), InlineKeyboardButton(text="💬 Destek", callback_data="menu:support", style="primary")],
+        [InlineKeyboardButton(text="ℹ️ Yardım", callback_data="menu:help", style="primary")]
     ]
     if is_admin(user_id): rows.append([InlineKeyboardButton(text="🛠️ Admin Paneli", callback_data="menu:admin", style="danger")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -331,9 +330,11 @@ async def build_welcome_text(user_id, first_name):
     return (f"🌟 **Hoş Geldin, {first_name}!**\n\n💳 **Cüzdan Bilgileriniz:**\n├ 💰 Bakiye: `{format_money(user['balance_cents'] if user else 0)}`\n├ 🎯 Puan: `{user['points'] if user else 0}`\n├ 📦 Sipariş: `{order_count}`\n└ 💎 VIP: `{vip_status}`\n\n🚀 *Sistemimiz 7/24 otomatik teslimat ile kesintisiz hizmet vermektedir.*\n⚡ *VIP üyelerimiz öncelikli işlem ve %20 indirim avantajına sahiptir.*\n\n👇 İşlem yapmak için aşağıdaki menüyü kullanın:")
 
 @router.message(CommandStart())
-async def start_handler(message: Message):
+async def start_handler(message: Message, state: FSMContext):
     if not message.from_user: return
     uid = message.from_user.id
+    
+    await state.clear()  # FSM durumunu sıfırla
     
     try: await message.answer("🔄 Ana menü hazırlanıyor...", reply_markup=ReplyKeyboardRemove())
     except: pass
@@ -374,10 +375,17 @@ async def start_handler(message: Message):
     text = await build_welcome_text(uid, message.from_user.first_name)
     await message.answer(text, reply_markup=main_keyboard(uid), parse_mode="Markdown")
 
+# Tüm butonlarda "Message is not modified" hatasını engelleyen güvenli fonksiyon
+async def safe_edit(cb: CallbackQuery, text: str, reply_markup=None, parse_mode=None):
+    try:
+        await cb.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except TelegramBadRequest:
+        pass
+
 @router.callback_query(F.data == "menu:back")
 async def back_to_menu(cb: CallbackQuery):
     text = await build_welcome_text(cb.from_user.id, cb.from_user.first_name)
-    await cb.message.edit_text(text, reply_markup=main_keyboard(cb.from_user.id), parse_mode="Markdown")
+    await safe_edit(cb, text, reply_markup=main_keyboard(cb.from_user.id), parse_mode="Markdown")
     await cb.answer()
 
 @router.callback_query(F.data == "menu:balance")
@@ -387,31 +395,46 @@ async def menu_balance(cb: CallbackQuery):
         row = await cursor.fetchone()
     vip_status = "Aktif Değil ❌" if not row or not row['vip_until'] or datetime.fromisoformat(row['vip_until']) <= now_utc() else f"Aktif ✅"
     text = (f"💰 **Cüzdan Detayları**\n\n🔹 Bakiye: `{format_money(row['balance_cents'] if row else 0)}`\n🔹 Puan: `{row['points'] if row else 0}`\n🔹 VIP Üyelik: `{vip_status}`")
-    await cb.message.edit_text(text, reply_markup=back_to_menu_kb(), parse_mode="Markdown")
+    await safe_edit(cb, text, reply_markup=back_to_menu_kb(), parse_mode="Markdown")
     await cb.answer()
 
 # ==========================================
-# YILDIZ İLE BAKİYE YÜKLEME
+# YILDIZ İLE BAKİYE YÜKLEME (HATA DÜZELTİLDİ)
 # ==========================================
 @router.callback_query(F.data == "menu:topup")
 async def menu_topup(cb: CallbackQuery):
-    await cb.message.edit_text("⭐ **Yıldız ile Bakiye Yükleme**\n\nPaket seçin:", reply_markup=topup_keyboard(), parse_mode="Markdown")
+    await safe_edit(cb, "⭐ **Yıldız ile Bakiye Yükleme**\n\nPaket seçin:", reply_markup=topup_keyboard(), parse_mode="Markdown")
+    await cb.answer()
 
 @router.callback_query(F.data.startswith("star:"))
 async def create_star_invoice(cb: CallbackQuery):
-    stars = int(cb.data.split(":")[1]); tier = next((t for t in STAR_TOPUP_TIERS if t[0] == stars), None)
-    if not tier: return await cb.answer("Geçersiz paket.", show_alert=True)
-    payload = f"topup:{uuid4().hex}"
-    async with db_session() as db:
-        await db.execute("INSERT INTO star_payment_intents (payload, user_id, stars_amount, credit_cents, created_at) VALUES (?, ?, ?, ?, ?)", (payload, cb.from_user.id, stars, tier[1], timestamp())); await db.commit()
     try:
-        await cb.bot.send_invoice(cb.from_user.id, "Bakiye Yükleme", f"{format_money(tier[1])} bakiye", payload, "", "XTR", [LabeledPrice("Bakiye", stars)]); await cb.answer()
+        stars = int(cb.data.split(":")[1])
+        tier = next((t for t in STAR_TOPUP_TIERS if t[0] == stars), None)
+        if not tier: return await cb.answer("Geçersiz paket.", show_alert=True)
+        
+        payload = f"topup:{uuid4().hex}"
+        async with db_session() as db:
+            await db.execute("INSERT INTO star_payment_intents (payload, user_id, stars_amount, credit_cents, created_at) VALUES (?, ?, ?, ?, ?)", (payload, cb.from_user.id, stars, tier[1], timestamp()))
+            await db.commit()
+        
+        await cb.bot.send_invoice(
+            chat_id=cb.from_user.id, 
+            title="Bakiye Yükleme", 
+            description=f"{format_money(tier[1])} bakiye", 
+            payload=payload, 
+            provider_token="",  # Telegram Stars için boş bırakılmalı
+            currency="XTR",     # Telegram Stars para birimi
+            prices=[LabeledPrice(label="Bakiye", amount=stars)]
+        )
+        await cb.answer()
     except Exception as e:
-        print("Invoice hatası:", e)
-        await cb.answer("Ödeme başlatılamadı. Lütfen sonra tekrar deneyin.", show_alert=True)
+        logger.exception("Stars ödeme başlatma hatası")
+        await cb.answer("Ödeme başlatılamadı. Telegram hesabınızda Stars bakiyesi olduğundan emin olun veya daha sonra tekrar deneyin.", show_alert=True)
 
 @router.pre_checkout_query()
-async def pre_checkout(query: PreCheckoutQuery): await query.answer(ok=True)
+async def pre_checkout(query: PreCheckoutQuery): 
+    await query.answer(ok=True)
 
 @router.message(F.successful_payment)
 async def on_payment(message: Message):
@@ -421,8 +444,12 @@ async def on_payment(message: Message):
         if row:
             await db.execute("UPDATE star_payment_intents SET status = 'paid' WHERE payload = ?", (message.successful_payment.invoice_payload,))
             await db.execute("UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?", (row['credit_cents'], message.from_user.id))
-            await add_transaction(db, message.from_user.id, row['credit_cents'], "stars", "Yıldız ile yükleme"); await db.commit()
-            cursor = await db.execute("SELECT balance_cents FROM users WHERE user_id = ?", (message.from_user.id,)); new_bal = (await cursor.fetchone())['balance_cents']
+            await add_transaction(db, message.from_user.id, row['credit_cents'], "stars", "Yıldız ile yükleme")
+            await db.commit()
+            
+            cursor = await db.execute("SELECT balance_cents FROM users WHERE user_id = ?", (message.from_user.id,))
+            new_bal = (await cursor.fetchone())['balance_cents']
+            
             await message.answer(f"🎉 **Tebrikler!**\n\n✅ Hesabınıza başarıyla `{format_money(row['credit_cents'])}` değerinde bakiye yüklemesi yapıldı.\n\n💰 Güncel Bakiyeniz: `{format_money(new_bal)}`", parse_mode="Markdown")
             await log_to_admins(message.bot, "Yıldız ile Yükleme", message.from_user.id, f"+{format_money(row['credit_cents'])}")
 
@@ -432,24 +459,21 @@ async def on_payment(message: Message):
 @router.callback_query(F.data == "menu:catalog")
 async def menu_catalog(cb: CallbackQuery):
     async with db_session() as db:
-        # Uygulama isimlerini grupla (Benzersiz uygulamalar)
         cursor = await db.execute("SELECT DISTINCT name FROM services WHERE active = 1")
         apps = await cursor.fetchall()
     
     if not apps:
-        return await cb.message.edit_text("🛒 Şu an markette aktif ürün bulunmuyor.", reply_markup=back_to_menu_kb())
+        return await safe_edit(cb, "🛒 Şu an markette aktif ürün bulunmuyor.", reply_markup=back_to_menu_kb())
     
-    # Uygulamaları buton olarak listele
     kb = [[InlineKeyboardButton(text=app['name'], callback_data=f"app:{app['name']}", style="primary")] for app in apps]
     kb.append([InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu:back", style="primary")])
-    await cb.message.edit_text("🛍️ Lütfen bir uygulama seçin:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await safe_edit(cb, "🛍️ Lütfen bir uygulama seçin:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await cb.answer()
 
 @router.callback_query(F.data.startswith("app:"))
 async def app_countries(cb: CallbackQuery):
     app_name = cb.data.split(":", 1)[1]
     async with db_session() as db:
-        # Seçilen uygulamanın ülkelerini ve fiyatlarını getir
         cursor = await db.execute("SELECT service_id, country_code, price_cents FROM services WHERE name = ? AND active = 1", (app_name,))
         products = await cursor.fetchall()
     
@@ -463,7 +487,7 @@ async def app_countries(cb: CallbackQuery):
         kb.append([InlineKeyboardButton(text=f"{cc} - {format_money(p['price_cents'])}", callback_data=f"buy:{p['service_id']}", style="success")])
     
     kb.append([InlineKeyboardButton(text="🔙 Geri", callback_data="menu:catalog", style="primary")])
-    await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    await safe_edit(cb, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
     await cb.answer()
 
 @router.callback_query(F.data.startswith("buy:"))
@@ -505,7 +529,8 @@ async def buy_service(cb: CallbackQuery):
 async def admin_product_start(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
     await state.set_state(AdminProductAddFlow.app_name)
-    await cb.message.edit_text("📦 **Market Ürünü Ekle**\n\nAdım 1: Uygulama Adı (Örn: `WhatsApp`, `Telegram`):")
+    await safe_edit(cb, "📦 **Market Ürünü Ekle**\n\nAdım 1: Uygulama Adı (Örn: `WhatsApp`, `Telegram`):")
+    await cb.answer()
 
 @router.message(AdminProductAddFlow.app_name)
 async def admin_product_name(message: Message, state: FSMContext):
@@ -540,7 +565,8 @@ async def admin_product_desc(message: Message, state: FSMContext):
 async def admin_product_del_start(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
     await state.set_state(AdminDeleteProductFlow.service_id)
-    await cb.message.edit_text("🗑️ **Ürün Sil**\n\nLütfen silinecek ürünün ID'sini yazın (Silmek yerine pasife alınır).")
+    await safe_edit(cb, "🗑️ **Ürün Sil**\n\nLütfen silinecek ürünün ID'sini yazın.")
+    await cb.answer()
 
 @router.message(AdminDeleteProductFlow.service_id)
 async def admin_product_del_id(message: Message, state: FSMContext):
@@ -550,7 +576,7 @@ async def admin_product_del_id(message: Message, state: FSMContext):
         await db.execute("UPDATE services SET active = 0 WHERE service_id = ?", (sid,))
         await db.commit()
     await state.clear()
-    await message.answer(f"✅ `#{sid}` ID'li ürün pasife alındı (silindi).", reply_markup=back_to_menu_kb())
+    await message.answer(f"✅ `#{sid}` ID'li ürün pasife alındı.", reply_markup=back_to_menu_kb())
 
 # ==========================================
 # PROMO VE HAZİNE KULLANIM MANTIĞI
@@ -662,17 +688,15 @@ async def menu_orders(cb: CallbackQuery):
     async with db_session() as db:
         cursor = await db.execute("SELECT order_id, service_name, amount_cents, status FROM orders WHERE user_id = ? ORDER BY order_id DESC LIMIT 10", (cb.from_user.id,))
         rows = await cursor.fetchall()
-    if not rows: return await cb.message.edit_text("📦 Henüz sipariş vermediniz.", reply_markup=back_to_menu_kb())
+    if not rows: 
+        await safe_edit(cb, "📦 Henüz sipariş vermediniz.", reply_markup=back_to_menu_kb())
+        return await cb.answer()
     statuses = {"pending": "⏳ Bekliyor", "completed": "✅ Tamamlandı", "refunded": "❌ İade"}
     text = "📦 **Son Siparişleriniz:**\n\n"
     for r in rows:
         text += f"🔹 *#{r['order_id']}* - {r['service_name']}\n   {format_money(r['amount_cents'])} | {statuses.get(r['status'], r['status'])}\n"
-    await cb.message.edit_text(text, reply_markup=back_to_menu_kb(), parse_mode="Markdown")
+    await safe_edit(cb, text, reply_markup=back_to_menu_kb(), parse_mode="Markdown")
     await cb.answer()
-
-@router.callback_query(F.data == "menu:coupon")
-async def menu_coupon(cb: CallbackQuery):
-    await cb.message.edit_text("🎟️ **İndirim Kuponu**\n\nKupon sistemi çok yakında aktif olacaktır!", reply_markup=back_to_menu_kb(), parse_mode="Markdown")
 
 @router.callback_query(F.data == "menu:leaderboard")
 async def menu_leaderboard(cb: CallbackQuery):
@@ -683,17 +707,20 @@ async def menu_leaderboard(cb: CallbackQuery):
     for i, r in enumerate(rows, 1):
         text += f"{i}. {r['username'] or r['first_name']} - {r['cnt']} davet\n"
     if not rows: text += "Henüz kimse yok."
-    await cb.message.edit_text(text, reply_markup=back_to_menu_kb(), parse_mode="Markdown")
+    await safe_edit(cb, text, reply_markup=back_to_menu_kb(), parse_mode="Markdown")
+    await cb.answer()
 
 @router.callback_query(F.data == "menu:help")
 async def menu_help(cb: CallbackQuery):
     text = "ℹ️ **Yardım**\n\nBotumuzu kullanarak dilediğiniz hizmeti satın alabilirsiniz.\n\n**Komutlar:**\n/start - Ana menü\n/balance - Bakiye\n/promo KOD - Promo kullan\n/hazine - Hazine kap"
-    await cb.message.edit_text(text, reply_markup=back_to_menu_kb(), parse_mode="Markdown")
+    await safe_edit(cb, text, reply_markup=back_to_menu_kb(), parse_mode="Markdown")
+    await cb.answer()
 
 @router.callback_query(F.data == "menu:support")
 async def menu_support(cb: CallbackQuery, state: FSMContext):
     await state.set_state(SupportFlow.body)
-    await cb.message.edit_text("💬 **Destek Talebi**\n\nLütfen sorununuzu tek mesaj halinde yazın:", parse_mode="Markdown")
+    await safe_edit(cb, "💬 **Destek Talebi**\n\nLütfen sorununuzu tek mesaj halinde yazın:", parse_mode="Markdown")
+    await cb.answer()
 
 @router.message(SupportFlow.body)
 async def support_body(message: Message, state: FSMContext):
@@ -715,17 +742,20 @@ async def menu_referral(cb: CallbackQuery):
         cursor = await db.execute("SELECT COUNT(*) as total, SUM(CASE WHEN rewarded_at IS NOT NULL THEN reward_cents ELSE 0 END) as earned FROM referrals WHERE referrer_id = ?", (cb.from_user.id,))
         row = await cursor.fetchone()
     text = (f"👥 **Referans Sistemi**\n\n🔗 **Davet Linkiniz:**\n`{link}`\n\n📊 **İstatistikleriniz:**\n• Davet Edilen: `{row['total'] or 0}` kişi\n• Kazanılan Ödül: `{format_money(row['earned'] or 0)}`\n\n{rule_text}")
-    await cb.message.edit_text(text, reply_markup=back_to_menu_kb(), parse_mode="Markdown")
+    await safe_edit(cb, text, reply_markup=back_to_menu_kb(), parse_mode="Markdown")
+    await cb.answer()
 
 @router.callback_query(F.data == "menu:admin")
 async def menu_admin(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return await cb.answer("Yetkiniz yok.", show_alert=True)
-    await cb.message.edit_text("🛠️ **Admin Paneli**\n\nİşlem seçin:", reply_markup=admin_panel_kb(), parse_mode="Markdown")
+    await safe_edit(cb, "🛠️ **Admin Paneli**\n\nİşlem seçin:", reply_markup=admin_panel_kb(), parse_mode="Markdown")
+    await cb.answer()
 
 @router.callback_query(F.data == "admin:settings")
 async def admin_settings(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return
-    await cb.message.edit_text("⚙️ **Özellik Ayarları**\n\nAçıp kapatmak istediğiniz özelliği seçin:", reply_markup=settings_kb(), parse_mode="Markdown")
+    await safe_edit(cb, "⚙️ **Özellik Ayarları**\n\nAçıp kapatmak istediğiniz özelliği seçin:", reply_markup=settings_kb(), parse_mode="Markdown")
+    await cb.answer()
 
 @router.callback_query(F.data.startswith("toggle:"))
 async def toggle_setting(cb: CallbackQuery):
@@ -745,7 +775,8 @@ async def admin_bal_start(cb: CallbackQuery, state: FSMContext):
     action = "eklemek" if "add" in cb.data else "silmek"
     await state.set_state(AdminBalanceFlow.user_query)
     await state.update_data(action=cb.data)
-    await cb.message.edit_text(f"💰 **Bakiye {action.capitalize()}**\n\nLütfen kullanıcının `@kullanıcıadı` veya `Telegram ID`'sini yazın:", parse_mode="Markdown")
+    await safe_edit(cb, f"💰 **Bakiye {action.capitalize()}**\n\nLütfen kullanıcının `@kullanıcıadı` veya `Telegram ID`'sini yazın:", parse_mode="Markdown")
+    await cb.answer()
 
 @router.message(AdminBalanceFlow.user_query)
 async def admin_bal_user(message: Message, state: FSMContext):
@@ -779,7 +810,7 @@ async def admin_bal_amount(message: Message, state: FSMContext):
 @router.callback_query(F.data == "admin:total_users")
 async def admin_total_users(cb: CallbackQuery):
     if not is_admin(cb.from_user.id): return
-    await cb.message.edit_text("⏳ Rapor hazırlanıyor...")
+    await safe_edit(cb, "⏳ Rapor hazırlanıyor...")
     async with db_session() as db:
         cursor = await db.execute("SELECT user_id, username, first_name, balance_cents, vip_until, created_at FROM users ORDER BY created_at DESC")
         users = await cursor.fetchall()
@@ -794,14 +825,16 @@ async def admin_total_users(cb: CallbackQuery):
         reg_date = u['created_at'][:10] if u['created_at'] else "-"
         report += f"{u['user_id']:<12} | {uname:<15} | {fname:<15} | {reg_date:<10} | {format_money(u['balance_cents']):<10} | {vip}\n"
     document = BufferedInputFile(report.encode('utf-8'), filename="kullanicilar.txt")
-    await cb.message.edit_text(f"📊 **Toplam Kullanıcı:** `{total}`\n\nDetaylı rapor aşağıda:", parse_mode="Markdown", reply_markup=back_to_menu_kb())
+    await safe_edit(cb, f"📊 **Toplam Kullanıcı:** `{total}`\n\nDetaylı rapor aşağıda:", parse_mode="Markdown", reply_markup=back_to_menu_kb())
     await cb.message.answer_document(document)
+    await cb.answer()
 
 @router.callback_query(F.data == "admin:promo_add")
 async def admin_promo_start(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
     await state.set_state(AdminPromoAddFlow.code)
-    await cb.message.edit_text("🎁 **Promo Kod Ekle**\n\nAdım 1: Promo kodunu yazın (Örn: `YENIYIL`):")
+    await safe_edit(cb, "🎁 **Promo Kod Ekle**\n\nAdım 1: Promo kodunu yazın (Örn: `YENIYIL`):")
+    await cb.answer()
 
 @router.message(AdminPromoAddFlow.code)
 async def admin_promo_code(message: Message, state: FSMContext):
@@ -846,7 +879,7 @@ async def admin_promo_duration(message: Message, state: FSMContext):
                 await message.answer(f"✅ **{data['code']}** kodu kanala gönderildi.", reply_markup=back_to_menu_kb())
                 return
             except Exception as e: 
-                print("Promo kanal hatası:", e)
+                logger.exception("Promo kanal hatası")
             
         await db.execute("INSERT INTO promos (code, bonus_cents, max_uses, expires_at) VALUES (?, ?, ?, ?)", (data['code'], data['bonus'], data['max_uses'], expires_at))
         await db.commit()
@@ -856,7 +889,8 @@ async def admin_promo_duration(message: Message, state: FSMContext):
 async def admin_hazine_start(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id): return
     await state.set_state(AdminHazineFlow.total_amount)
-    await cb.message.edit_text("💰 **Hazine Patlatma**\n\nAdım 1: Dağıtılacak toplam bakiye ne kadar? (TL, Örn: `100`)")
+    await safe_edit(cb, "💰 **Hazine Patlatma**\n\nAdım 1: Dağıtılacak toplam bakiye ne kadar? (TL, Örn: `100`)")
+    await cb.answer()
 
 @router.message(AdminHazineFlow.total_amount)
 async def admin_hazine_amount(message: Message, state: FSMContext):
@@ -899,7 +933,7 @@ async def admin_hazine_duration(message: Message, state: FSMContext):
             await message.answer("✅ Hazine kanala gönderildi.", reply_markup=back_to_menu_kb())
             return
         except Exception as e: 
-            print("Hazine kanal hatası:", e)
+            logger.exception("Hazine kanal hatası")
     await message.answer("✅ Hazine oluşturuldu (Kanal ayarlanmadığı için gönderilemedi).", reply_markup=back_to_menu_kb())
 
 # ==========================================
