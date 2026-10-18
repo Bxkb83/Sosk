@@ -67,7 +67,6 @@ class AdminHazineFlow(StatesGroup):
     user_limit = State()
     duration = State()
 
-# YENİ: Hizmet ve Ürün Ekleme Akışları
 class AdminServiceFlow(StatesGroup):
     name = State()
 
@@ -593,7 +592,6 @@ async def process_special_claim(message, sp_id, user):
                                  (user.id, sp_id, sp['name'], price, timestamp(), (now_utc()+timedelta(seconds=CANCEL_SECONDS)).isoformat()))
         oid = cursor.lastrowid; await add_transaction(db, user.id, -price, "order", f"Sipariş #{oid}"); await db.commit()
         
-        # Kanal mesajını güncelle
         if new_users >= sp['max_users'] and sp['msg_id'] and PROMO_CHANNEL_ID:
             try: await message.bot.delete_message(PROMO_CHANNEL_ID, sp['msg_id'])
             except: pass
@@ -701,7 +699,7 @@ async def admin_special_users(message: Message, state: FSMContext):
     await message.answer("⏳ Bu hizmet kaç dakika aktif kalsın? (Örn: `60`):")
 
 @router.message(AdminSpecialServiceFlow.duration)
-async def admin_special_duration(message: Message, state: FSMContext, bot: types.Bot):
+async def admin_special_duration(message: Message, state: FSMContext, bot: Bot):
     if not message.text.isdigit(): return await message.answer("❌ Lütfen sayı girin.")
     duration = int(message.text)
     data = await state.get_data(); await state.clear()
